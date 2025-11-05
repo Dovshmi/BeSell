@@ -1,6 +1,6 @@
-# bezeq_bonus_app_version 6.py
+# bezeq_bonus_app_version 7.py
 # -*- coding: utf-8 -*-
-import json, csv, io, sys, subprocess, random
+import json, csv, io, sys, subprocess, random, uuid
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -37,7 +37,8 @@ APP_TZ = ZoneInfo("Asia/Jerusalem")
 DATA_DIR = Path("data")
 USERS_PATH = DATA_DIR / "users.json"
 RECORDS_PATH = DATA_DIR / "records.json"
-BONUSES_PATH = DATA_DIR / "bonuses.json"  # לוח מחירים היסטורי לפי תאריך תחולה
+BONUSES_PATH = DATA_DIR / "bonuses.json"   # היסטוריית בונוסים לפי תאריך
+MSGS_PATH = DATA_DIR / "messages.json"     # הודעות מערכת/פקודות לאדמין
 
 PRODUCTS = [
     {"code": "fiber_new", "name": "אינטרנט סיבים חדש", "bonus": 23},
@@ -61,13 +62,14 @@ def ensure_files():
     if not RECORDS_PATH.exists():
         RECORDS_PATH.write_text(json.dumps({"records": []}, ensure_ascii=False, indent=2), encoding="utf-8")
     if not BONUSES_PATH.exists():
-        # ברירת מחדל: מחירים ראשוניים החלים "מההתחלה"
         base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
         BONUSES_PATH.write_text(json.dumps({
             "schedules": [
                 {"effective_date": "1970-01-01", "prices": base_prices}
             ]
         }, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not MSGS_PATH.exists():
+        MSGS_PATH.write_text(json.dumps({"messages": []}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def load_users():
     ensure_files()
@@ -91,7 +93,6 @@ def load_bonus_schedules():
     ensure_files()
     with open(BONUSES_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # normalize sort ascending by effective_date
     data["schedules"].sort(key=lambda s: s["effective_date"])
     return data
 
@@ -100,8 +101,89 @@ def save_bonus_schedules(data):
     with open(BONUSES_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_messages():
+    ensure_files()
+    with open(MSGS_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_messages(data):
+    with open(MSGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ---------------- Messages / POPUP logic ----------------
+def create_message(text: str, target_all: bool, target_emails: list[str], target_teams: list[str], sticky: bool=True, meta: dict|None=None, title: str|None=None):
+    """Create a system message. 
+    sticky=True keeps the popup until the user closes it. 
+    Each user sees it once; dismissal stored in 'dismissed_for' list of emails.
+    """
+    data = load_messages()
+    msg = {
+        "id": str(uuid.uuid4()),
+        "title": title or "הודעה",
+        "text": text,
+        "target_all": bool(target_all),
+        "target_emails": list(sorted(set([e.lower() for e in (target_emails or [])]))),
+        "target_teams": list(sorted(set(target_teams or []))),
+        "created_at": datetime.now(APP_TZ).isoformat(),
+        "active": True,
+        "sticky": bool(sticky),
+        "dismissed_for": [],
+        "meta": meta or {},
+    }
+    data["messages"].append(msg)
+    save_messages(data)
+    return msg["id"]
+
+def update_message(msg_id: str, **fields):
+    data = load_messages()
+    for m in data["messages"]:
+        if m["id"] == msg_id:
+            m.update({k:v for k,v in fields.items() if k in {"text","target_all","target_emails","target_teams","active","sticky","meta"}})
+            save_messages(data)
+            return True
+    return False
+
+def delete_message(msg_id: str):
+    data = load_messages()
+    data["messages"] = [m for m in data["messages"] if m["id"] != msg_id]
+    save_messages(data)
+
+def eligible_messages_for_user(user: dict):
+    """Return active messages the user hasn't dismissed and that target them."""
+    data = load_messages()
+    msgs = []
+    email = user["email"].lower().strip()
+    team = user.get("team","")
+    for m in data["messages"]:
+        if not m.get("active", True):
+            continue
+        if email in m.get("dismissed_for", []):
+            continue
+        if m.get("target_all"):
+            msgs.append(m)
+            continue
+        if email in [e.lower() for e in m.get("target_emails", [])]:
+            msgs.append(m)
+            continue
+        if team and team in m.get("target_teams", []):
+            msgs.append(m)
+            continue
+    # order by created_at ascending
+    msgs.sort(key=lambda x: x.get("created_at",""))
+    return msgs
+
+def mark_dismissed_for_user(msg_id: str, user_email: str):
+    data = load_messages()
+    for m in data["messages"]:
+        if m["id"] == msg_id:
+            lst = set(m.get("dismissed_for", []))
+            lst.add(user_email.lower().strip())
+            m["dismissed_for"] = sorted(lst)
+            break
+    save_messages(data)
+
+# ---------------- Bonus price lookup ----------------
 def get_bonus_for(product_code: str, on_date: str | date) -> int:
-    """Return the bonus (₪) for product_code applicable on on_date according to schedules."""
     if isinstance(on_date, date):
         d = on_date
     else:
@@ -158,6 +240,21 @@ def month_bounds(d: date):
         nxt = start.replace(month=start.month+1, day=1)
     end = nxt - timedelta(days=1)
     return start, end
+
+def fmt_ts(ts: str) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        try:
+            # if tz-aware, normalize to app TZ
+            dt = dt.astimezone(APP_TZ)
+        except Exception:
+            pass
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return ts
+
 
 # ---------------- Users helpers ----------------
 def _random_hex_color(existing: set[str]):
@@ -249,7 +346,6 @@ def get_counts_for_user_date(email: str, d: date):
     return out
 
 def aggregate_user_counts(email: str, start_d: date, end_d: date):
-    """Return counts per product in range (for table columns)."""
     db = load_records()
     out = {p["code"]: 0 for p in PRODUCTS}
     s = start_d.isoformat(); e = end_d.isoformat()
@@ -259,7 +355,6 @@ def aggregate_user_counts(email: str, start_d: date, end_d: date):
     return out
 
 def sum_bonus_for_email_range(email: str, start_d: date, end_d: date) -> int:
-    """Accurate bonus over range using the schedule valid on each record date."""
     db = load_records()
     s = start_d.isoformat(); e = end_d.isoformat()
     total = 0
@@ -268,7 +363,7 @@ def sum_bonus_for_email_range(email: str, start_d: date, end_d: date) -> int:
             total += int(r["qty"]) * get_bonus_for(r["product"], r["date"])
     return int(total)
 
-# --------- Group (multi-team) aggregations for Admin ---------
+# --------- Group helpers ---------
 def all_users_list(include_invisible=True):
     db = load_users()
     users = list(db.get("users", {}).values())
@@ -372,6 +467,7 @@ def inject_base_css():
     .user-badge-side .dot{ width:16px; height:16px; border-radius:999px; display:inline-block; }
     .user-badge-side .u-text{ font-weight:700; font-size:1.05rem; display:flex; align-items:center; gap:.5rem; }
     .role-badge{ font-size:.72rem; font-weight:700; padding:.15rem .45rem; border-radius:999px; background:#f59e0b1a; border:1px solid #f59e0b55; color:#f59e0b; }
+    .popup-title{ font-weight:800; font-size:1.1rem; margin-bottom:.35rem; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -381,6 +477,7 @@ if "theme_light" not in st.session_state:
     st.session_state.theme_light = True
 if "user" not in st.session_state:
     st.session_state.user = None
+
 
 with st.sidebar:
     if st.session_state.user:
@@ -462,6 +559,54 @@ with st.sidebar:
         if st.button("התנתקות", use_container_width=True):
             st.session_state.user = None
             st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 📬 הודעות מערכת")
+    # Message Center: show unread for this user + history, allow acknowledging
+    if st.session_state.user:
+        user_email = st.session_state.user["email"].lower().strip()
+        md = load_messages()
+        msgs_all = sorted(md.get("messages", []), key=lambda m: m.get("created_at",""), reverse=True)
+        unread = []
+        read = []
+        team = st.session_state.user.get("team","")
+        for m in msgs_all:
+            if not m.get("active", True):
+                continue  # only active messages in the user panel
+            targeted = m.get("target_all") or \
+                       (user_email in [e.lower() for e in m.get("target_emails", [])]) or \
+                       (team and team in m.get("target_teams", []))
+            if not targeted:
+                continue
+            if user_email in m.get("dismissed_for", []):
+                read.append(m)
+            else:
+                unread.append(m)
+        cA, cB = st.columns([1,1])
+        cA.caption(f"לא נקראו: **{len(unread)}**")
+        if unread and cB.button("✔️ סמן הכל כנקרא", use_container_width=True):
+            for m in unread:
+                mark_dismissed_for_user(m["id"], user_email)
+            st.experimental_rerun()
+
+        if unread:
+            st.markdown("#### לא נקראו")
+            for m in unread:
+                with st.expander(f"{m.get('title','הודעה')} • {fmt_ts(m.get('created_at',''))}", expanded=True):
+                    st.write(m.get("text",""))
+                    pass  # meta hidden
+                    if st.button("סגור / קראתי", key=f"ack_{m['id']}"):
+                        mark_dismissed_for_user(m["id"], user_email)
+                        st.experimental_rerun()
+        st.markdown("#### היסטוריה")
+        if read:
+            for m in read[:50]:
+                with st.expander(f"{m.get('title','הודעה')} • {fmt_ts(m.get('created_at',''))}", expanded=False):
+                    st.write(m.get("text",""))
+                    pass  # meta hidden
+        else:
+            st.caption("אין היסטוריית הודעות.")
+
     else:
         st.info("התחבר/י כדי לראות הגדרות.")
 
@@ -519,6 +664,9 @@ def refresh_user():
 refresh_user()
 user = st.session_state.user
 
+# Show any pending POPUPs as soon as user is authenticated
+
+
 # Top badge
 st.markdown(
     f"""
@@ -533,7 +681,7 @@ st.markdown(
 # -------- Tabs --------
 tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא"]
 if user.get("is_admin"):
-    tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)"])
+    tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)", "פקודות (אדמין)"])
 tab_today, tab_prev, tab_team, tab_reports, *maybe_admin_tabs = st.tabs(tabs)
 
 # ------ TODAY ------
@@ -558,7 +706,10 @@ with tab_today:
     c1.metric("בונוס היום (₪)", int(bonus_today))
     c2.metric("סה\"כ פריטים", sum(counts_today.values()))
     g = user.get("goals", {})
-    c3.metric("התקדמות מול יעד יומי", f"{int((bonus_today/max(1,g.get('daily',1)))*100)}%") if g.get("daily", 0) else c3.metric("התקדמות מול יעד יומי", "—")
+    if g.get("daily", 0):
+        c3.metric("התקדמות מול יעד יומי", f"{int((bonus_today/max(1,g.get('daily',1)))*100)}%")
+    else:
+        c3.metric("התקדמות מול יעד יומי", "—")
     yest = today - timedelta(days=1)
     y_counts = get_counts_for_user_date(user["email"], yest)
     y_bonus = sum(qty * get_bonus_for(code, yest) for code, qty in y_counts.items())
@@ -619,7 +770,6 @@ with tab_team:
     if selected_team_key == "ALL":
         members = group_members_by_filter("ALL", include_invisible=include_invisible)
         members = [m for m in members if m.get("email") and m.get("name")]
-        # counts and bonuses
         counts = {m["email"]: aggregate_user_counts(m["email"], start_d, end_d) for m in members}
         bonuses = {m["email"]: sum_bonus_for_email_range(m["email"], start_d, end_d) for m in members}
         label_for_header = "כל הצוותים"
@@ -629,7 +779,6 @@ with tab_team:
 
     st.markdown(f"**תצוגה:** {label_for_header}  •  טווח: {period}  •  {'כולל בלתי נראים' if include_invisible else 'ללא בלתי נראים'}")
 
-    # Table
     header = ["שם", "צוות", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
     rows = []
     for m in members:
@@ -651,7 +800,6 @@ with tab_team:
     else:
         st.info("אין נתונים להצגה עבור הטווח.")
 
-    # Chart
     st.markdown("### 📈 גרף בונוס לפי זמן")
     df_series = build_group_timeseries(members, period)
     if df_series.empty:
@@ -699,15 +847,16 @@ with tab_reports:
         else:
             st.info("אין נתונים בטווח שנבחר.")
 
-# ------ ADMIN: Users (existing) & Bonus Schedules (new) ------
+# ------ ADMIN: Users, Bonus Schedules, Commands ------
 if user.get("is_admin") and maybe_admin_tabs:
     tab_admin_users = maybe_admin_tabs[0]
     tab_admin_prices = maybe_admin_tabs[1]
+    tab_admin_cmds = maybe_admin_tabs[2]
+
     # --- Admin Users ---
     with tab_admin_users:
         st.header("👑 ניהול משתמשים (אדמין)")
         st.caption("שינוי הרשאות אדמין נעשה **רק** בעריכת הקובץ data/users.json. כאן ניתן למחוק, לערוך פרופיל, לאפס סיסמה ולסנן משתמשים.")
-
         db = load_users()
         all_users = list(db.get("users", {}).values())
         teams = sorted({u.get("team","") for u in all_users if u.get("team")})
@@ -804,32 +953,27 @@ if user.get("is_admin") and maybe_admin_tabs:
     # --- Admin Bonus Schedules ---
     with tab_admin_prices:
         st.header("👑 ניהול בונוסים לפי תאריך תחילה (אדמין)")
-        st.caption("קבע/י בונוס לכל מוצר לפי תאריך תחילה. החישוב בגרפים/טבלאות יתחשב במחירים שהיו בתוקף במועד המכירה.")
-
+        st.caption("קבע/י בונוס לכל מוצר לפי תאריך תחילה. חישובים יתבססו על המחיר שהיה בתוקף במועד המכירה.")
         data = load_bonus_schedules()
-        schedules = data["schedules"][:]  # already sorted asc
+        schedules = data["schedules"][:]
         if not schedules:
             st.error("לא נמצא קובץ בונוסים.")
         else:
-            # Create or edit schedule
             st.subheader("➕ יצירת/עדכון לוח מחירים חדש")
             c1, c2 = st.columns([1,3])
             eff_date = c1.date_input("תאריך תחילה", value=now_ij().date())
-            # find previous schedule as template
             base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
             for sch in schedules:
                 if date.fromisoformat(sch["effective_date"]) <= eff_date:
                     base_prices = sch["prices"]
                 else:
                     break
-            # inputs grid
             cols = st.columns(3)
             new_prices = {}
             for i,p in enumerate(PRODUCTS):
                 col = cols[i % 3]
                 new_prices[p["code"]] = int(col.number_input(f"{p['name']}", min_value=0, step=1, value=int(base_prices.get(p["code"], p["bonus"]))))
             if st.button("שמירה כלוח מחירים בתוקף מהתאריך הנבחר", use_container_width=True):
-                # overwrite if same date exists, else append
                 replaced = False
                 for sch in data["schedules"]:
                     if sch["effective_date"] == eff_date.isoformat():
@@ -839,12 +983,17 @@ if user.get("is_admin") and maybe_admin_tabs:
                 if not replaced:
                     data["schedules"].append({"effective_date": eff_date.isoformat(), "prices": new_prices})
                 save_bonus_schedules(data)
-                st.success("לוח המחירים נשמר/עודכן.")
+                # AUTO POPUP to all users
+                create_message(
+                    text=f"עודכן לוח בונוסים החל מ־{eff_date.isoformat()}. אנא עיינו בשינויים.",
+                    target_all=True, target_emails=[], target_teams=[],
+                    sticky=True, meta={"type":"bonus_update","effective_date":eff_date.isoformat(),"prices":new_prices}, title="שינוי בונוס"
+                )
+                st.success("לוח המחירים נשמר/עודכן ונשלחה הודעת POP-UP לכל המשתמשים.")
                 st.rerun()
 
             st.markdown("---")
             st.subheader("🗂️ כל הלוחות (按 תאריך)")
-            # show newest first for convenience
             schedules = load_bonus_schedules()["schedules"]
             schedules.sort(key=lambda s: s["effective_date"], reverse=True)
             for sch in schedules:
@@ -857,11 +1006,8 @@ if user.get("is_admin") and maybe_admin_tabs:
                     cc1, cc2, cc3 = st.columns([1,1,2])
                     new_eff = cc1.date_input("שנה תאריך תחילה", value=date.fromisoformat(sch["effective_date"]), key=f"eff_{sch['effective_date']}")
                     if cc2.button("עדכון לוח", key=f"upd_{sch['effective_date']}"):
-                        # update schedule, possibly change date (ensure no duplicate dates)
                         d_all = load_bonus_schedules()
-                        # remove the old one
                         d_all["schedules"] = [s for s in d_all["schedules"] if s["effective_date"] != sch["effective_date"]]
-                        # if another schedule with same new date exists, overwrite it
                         found = False
                         for s2 in d_all["schedules"]:
                             if s2["effective_date"] == new_eff.isoformat():
@@ -871,7 +1017,12 @@ if user.get("is_admin") and maybe_admin_tabs:
                         if not found:
                             d_all["schedules"].append({"effective_date": new_eff.isoformat(), "prices": edited})
                         save_bonus_schedules(d_all)
-                        st.success("עודכן.")
+                        create_message(
+                            text=f"עודכן לוח בונוסים (תוקף מ־{new_eff.isoformat()}).",
+                            target_all=True, target_emails=[], target_teams=[],
+                            sticky=True, meta={"type":"bonus_update","effective_date":new_eff.isoformat(),"prices":edited}, title="שינוי בונוס"
+                        )
+                        st.success("עודכן ונשלחה הודעת POP-UP לכל המשתמשים.")
                         st.rerun()
                     if cc3.button("מחיקה", key=f"del_{sch['effective_date']}"):
                         d_all = load_bonus_schedules()
@@ -880,7 +1031,68 @@ if user.get("is_admin") and maybe_admin_tabs:
                             st.error("לא ניתן למחוק את כל הלוחות. חייב להישאר לפחות לוח אחד.")
                         else:
                             save_bonus_schedules(d_all)
-                            st.success("נמחק.")
+                            create_message(
+                                text=f"לוח בונוסים בתוקף מ־{sch['effective_date']} נמחק.",
+                                target_all=True, target_emails=[], target_teams=[],
+                                sticky=True, meta={"type":"bonus_delete","effective_date":sch['effective_date']}, title="שינוי בונוס"
+                            )
+                            st.success("נמחק ונשלחה הודעת POP-UP לכל המשתמשים.")
                             st.rerun()
+
+    # --- Admin Commands (POP-UP) ---
+    with tab_admin_cmds:
+        st.header("📣 פקודות / הודעות POP-UP (אדמין)")
+        st.caption("שליחת הודעת מערכת קופצת למשתמשים: ספציפיים, לפי צוות, או לכולם. כל משתמש רואה את ההודעה פעם אחת עד שיסגור אותה.")
+
+        db = load_users()
+        all_users = list(db.get("users", {}).values())
+        all_emails = [u["email"] for u in all_users]
+        all_teams = sorted({u.get("team","") for u in all_users if u.get("team")})
+
+        send_to_all = st.checkbox("שלח לכולם", value=False)
+        colr1, colr2 = st.columns(2)
+        target_users = []
+        target_teams = []
+        if not send_to_all:
+            target_users = colr1.multiselect("בחר משתמשים ספציפיים", options=all_emails)
+            target_teams = colr2.multiselect("או בחר צוותים", options=all_teams)
+
+        title_msg = st.text_input("כותרת ההודעה", placeholder="למשל: תזכורת חשובה" )
+        text = st.text_area("תוכן ההודעה", placeholder="מה תרצה שיקפוץ למשתמשים?")
+        sticky = st.checkbox("הודעה דביקה (נשארת עד סגירה)", value=True)
+        if st.button("שליחה", type="primary"):
+            if not text.strip():
+                st.error("נא למלא תוכן הודעה.")
+            elif not send_to_all and not target_users and not target_teams:
+                st.error("בחר משתמשים/צוותים או סמן 'שלח לכולם'.")
+            else:
+                title_final = title_msg.strip() if title_msg and title_msg.strip() else "הודעה"
+                msg_id = create_message(text=text, target_all=send_to_all, target_emails=target_users, target_teams=target_teams, sticky=sticky, meta={"type":"admin_manual"}, title=title_final)
+                st.success(f"נשלחה הודעה (msg_id={msg_id[:8]}...).")
+
+        st.markdown("---")
+        st.subheader("📜 היסטוריית הודעות")
+        md = load_messages()
+        msgs = sorted(md["messages"], key=lambda m: m.get("created_at",""), reverse=True)
+        for m in msgs:
+            with st.expander(f"#{m['id'][:8]} • {'פעילה' if m.get('active',True) else 'כבויה'} • {m.get('created_at','')}"):
+                st.write(m.get("text",""))
+                st.json({
+                    "target_all": m.get("target_all"),
+                    "target_emails": m.get("target_emails"),
+                    "target_teams": m.get("target_teams"),
+                    "sticky": m.get("sticky"),
+                    "dismissed_count": len(m.get("dismissed_for",[]))
+                })
+                c1, c2, c3 = st.columns([1,1,2])
+                new_active = c1.toggle("פעילה", value=m.get("active", True), key=f"act_{m['id']}")
+                if c2.button("שמירת מצב פעילה", key=f"save_active_{m['id']}"):
+                    update_message(m["id"], active=new_active)
+                    st.success("עודכן.")
+                    st.rerun()
+                if c3.button("מחיקה", key=f"del_msg_{m['id']}"):
+                    delete_message(m["id"])
+                    st.success("נמחקה.")
+                    st.rerun()
 
 end_skin()
