@@ -1,4 +1,4 @@
-# bezeq_bonus_app_version 2.py
+# bezeq_bonus_app_version 5.py
 # -*- coding: utf-8 -*-
 import json, csv, io, sys, subprocess, random
 from datetime import datetime, date, timedelta
@@ -120,9 +120,8 @@ def month_bounds(d: date):
     end = nxt - timedelta(days=1)
     return start, end
 
-# ---------------- Users ----------------
+# ---------------- Users helpers ----------------
 def _random_hex_color(existing: set[str]):
-    # generate distinct-ish colors
     while True:
         h = random.randint(0, 359)
         s = random.randint(60, 90)
@@ -146,8 +145,7 @@ def new_user_payload(name, email, password, team, invisible=False):
         "created_at": now_ij().isoformat(),
         "goals": {"daily": 0, "weekly": 0, "monthly": 0},
         "color": color,
-        # Admin flag is set only via JSON edit, not via UI
-        "is_admin": False
+        "is_admin": False  # admin only via JSON edit
     }
 
 def register_user(name, email, password, team, invisible):
@@ -173,7 +171,7 @@ def update_user(email, **fields):
     user = db["users"].get(email.lower().strip())
     if not user:
         return False, "משתמש לא נמצא."
-    if "is_admin" in fields:  # not allowed from UI
+    if "is_admin" in fields:  # never from UI
         fields.pop("is_admin")
     user.update(fields)
     db["users"][email.lower().strip()] = user
@@ -190,15 +188,16 @@ def delete_user(email):
     save_records(dbr)
     return True
 
-# ---------------- Records ----------------
+# ---------------- Records & Aggregations ----------------
 def add_or_set_counts(email: str, d: date, counts: dict):
     db = load_records()
     date_s = d.isoformat()
     db["records"] = [r for r in db["records"] if not (r["email"] == email and r["date"] == date_s)]
     ts = now_ij().isoformat()
     for code, qty in counts.items():
-        if int(qty) > 0:
-            db["records"].append({"email": email, "date": date_s, "product": code, "qty": int(qty), "ts": ts})
+        qty = int(qty)
+        if qty > 0:
+            db["records"].append({"email": email, "date": date_s, "product": code, "qty": qty, "ts": ts})
     save_records(db)
 
 def get_counts_for_user_date(email: str, d: date):
@@ -213,86 +212,57 @@ def get_counts_for_user_date(email: str, d: date):
 def aggregate_user(email: str, start_d: date, end_d: date):
     db = load_records()
     out = {p["code"]: 0 for p in PRODUCTS}
+    s = start_d.isoformat(); e = end_d.isoformat()
     for r in db["records"]:
-        if r["email"] == email and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+        if r["email"] == email and s <= r["date"] <= e:
             out[r["product"]] = out.get(r["product"], 0) + int(r["qty"])
     return out
 
 def compute_bonus(counts: dict) -> int:
     total = 0
     for code, qty in counts.items():
-        b = PRODUCT_INDEX.get(code, {}).get("bonus", 0)
-        total += int(qty) * int(b)
+        total += int(qty) * int(PRODUCT_INDEX.get(code, {}).get("bonus", 0))
     return total
 
-def team_members(team: str):
+def all_users_list(include_invisible=True):
     db = load_users()
-    return [u for u in db["users"].values() if u.get("team","").strip() == team.strip()]
+    users = list(db.get("users", {}).values())
+    return users if include_invisible else [u for u in users if not u.get("invisible")]
 
-def team_visible_members(team: str):
-    return [m for m in team_members(team) if not m.get("invisible")]
+def team_members(team: str, include_invisible=False):
+    users = all_users_list(include_invisible=include_invisible)
+    return [u for u in users if u.get("team","").strip() == team.strip()]
 
 def team_aggregate(team: str, start_d: date, end_d: date, include_invisible=False):
-    members = team_members(team) if include_invisible else team_visible_members(team)
+    members = team_members(team, include_invisible=include_invisible)
     emails = [m["email"] for m in members]
-    totals = {}
-    for e in emails:
-        totals[e] = aggregate_user(e, start_d, end_d)
+    totals = {e: aggregate_user(e, start_d, end_d) for e in emails}
     return members, totals
 
-# ---------------- UI skin/RTL ----------------
-def inject_base_css():
-    st.markdown("""
-    
-    <style>
-    :root { --sidebar-width: 18rem; }
-    [data-testid="stSidebar"]{
-        left: auto !important;
-        right: 0 !important;
-        border-left: 1px solid #1f2937 !important;
-        border-right: none !important;
-        width: var(--sidebar-width) !important;
-        z-index: 100;
-    }
-    [data-testid="stSidebarCollapsedControl"]{
-        right: 0.25rem !important;
-        left: auto !important;
-    }
-    [data-testid="stSidebar"][aria-expanded="true"] ~ div [data-testid="stAppViewContainer"]{
-        padding-right: calc(var(--sidebar-width) + 1rem) !important;
-    }
-    [data-testid="stSidebar"][aria-expanded="false"] ~ div [data-testid="stAppViewContainer"]{
-        padding-right: 1rem !important;
-    }
-    html, body { overflow-x: hidden; }
-    .user-badge-side{ display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.25rem .25rem .75rem 0; }
-    .user-badge-side .dot{ width:16px; height:16px; border-radius:999px; display:inline-block; }
-    .user-badge-side .u-text{ font-weight:700; font-size:1.05rem; display:flex; align-items:center; gap:.5rem; }
-    .role-badge{ font-size:.72rem; font-weight:700; padding:.15rem .45rem; border-radius:999px; background:#f59e0b1a; border:1px solid #f59e0b55; color:#f59e0b; }
-    </style>
+# --------- Group (multi-team) aggregations for Admin ---------
+def group_members_by_filter(team_filter: str, include_invisible: bool):
+    if team_filter == "ALL":
+        return all_users_list(include_invisible=include_invisible)
+    return team_members(team_filter, include_invisible=include_invisible)
 
-    """, unsafe_allow_html=True)
+def _display_label(member: dict) -> str:
+    """Legend label: always 'name · team' if team exists, regardless of period."""
+    name = member.get("name","")
+    team = member.get("team","")
+    return f"{name} · {team}" if team else name
 
-def begin_skin(light: bool):
-    klass = "light app-skin" if light else "app-skin"
-    st.markdown(f'<div class="{klass}">', unsafe_allow_html=True)
-
-def end_skin():
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------- Charts helpers ----------------
-def build_team_timeseries(team: str, period: str) -> pd.DataFrame:
-    members = team_visible_members(team)
+def build_group_timeseries(members: list, period: str) -> pd.DataFrame:
+    """index=bucket; columns=display labels; values=bonus in bucket for the provided members list."""
     if not members:
         return pd.DataFrame()
-    email_to_name = {m["email"]: m["name"] for m in members}
+    email_to_label = {m["email"]: _display_label(m) for m in members}
     recs = load_records()["records"]
     today = now_ij().date()
     rows = []
     if period == "היום":
         target = today.isoformat()
         for r in recs:
-            if r["email"] in email_to_name and r["date"] == target:
+            if r["email"] in email_to_label and r["date"] == target:
                 try:
                     ts = datetime.fromisoformat(r["ts"]).astimezone(APP_TZ)
                     hour = ts.hour
@@ -301,66 +271,44 @@ def build_team_timeseries(team: str, period: str) -> pd.DataFrame:
                 bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
                 rows.append({"bucket": hour, "email": r["email"], "bonus": bonus})
         idx = pd.Index(range(24), name="שעה")
+        bucket_name = "שעה"
     elif period == "שבוע נוכחי":
         start_d, end_d = week_bounds(today)
         for r in recs:
-            if r["email"] in email_to_name and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+            if r["email"] in email_to_label and start_d.isoformat() <= r["date"] <= end_d.isoformat():
                 d = date.fromisoformat(r["date"])
                 bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
                 rows.append({"bucket": d, "email": r["email"], "bonus": bonus})
         idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
-    else:
+        bucket_name = "תאריך"
+    else:  # חודש נוכחי
         start_d, end_d = month_bounds(today)
         for r in recs:
-            if r["email"] in email_to_name and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+            if r["email"] in email_to_label and start_d.isoformat() <= r["date"] <= end_d.isoformat():
                 d = date.fromisoformat(r["date"])
                 bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
                 rows.append({"bucket": d, "email": r["email"], "bonus": bonus})
         idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
+        bucket_name = "תאריך"
     if not rows:
         return pd.DataFrame(index=idx)
     df = pd.DataFrame(rows).groupby(["bucket","email"], as_index=False)["bonus"].sum()
     df_p = df.pivot_table(index="bucket", columns="email", values="bonus", aggfunc="sum").fillna(0)
+    # rename columns to display labels (always include team)
+    df_p = df_p.rename(columns=email_to_label)
     df_p = df_p.reindex(idx, fill_value=0)
-    df_p.index.name = "תאריך" if isinstance(df_p.index[0], (pd.Timestamp, date)) else "שעה"
-    df_p = df_p.rename(columns=email_to_name)
+    df_p.index.name = bucket_name
     return df_p
 
-def build_personal_timeseries(email: str, start_d: date, end_d: date) -> pd.DataFrame:
-    recs = load_records()["records"]
-    rows = []
-    if start_d == end_d:
-        for r in recs:
-            if r["email"] == email and r["date"] == start_d.isoformat():
-                try:
-                    ts = datetime.fromisoformat(r["ts"]).astimezone(APP_TZ)
-                    bucket = ts.hour
-                except Exception:
-                    bucket = 0
-                bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
-                rows.append({"bucket": bucket, "bonus": bonus})
-        idx = pd.Index(range(24), name="שעה")
-    else:
-        for r in recs:
-            if r["email"] == email and start_d.isoformat() <= r["date"] <= end_d.isoformat():
-                bucket = date.fromisoformat(r["date"])
-                bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
-                rows.append({"bucket": bucket, "bonus": bonus})
-        idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
-    if not rows:
-        return pd.DataFrame(index=idx, data={"בונוס": [0]*len(idx)})
-    df = pd.DataFrame(rows).groupby("bucket", as_index=True)["bonus"].sum()
-    df = df.reindex(idx, fill_value=0).to_frame(name="בונוס")
-    return df
-
-def altair_team_chart(df: pd.DataFrame, team: str):
+# ---------------- Charts helpers ----------------
+def altair_group_chart(df: pd.DataFrame, members: list):
     if df.empty:
         return None
     long = df.reset_index().melt(id_vars=df.index.name, var_name="משתמש", value_name="בונוס")
-    members = team_visible_members(team)
-    name_to_color = {m["name"]: m.get("color", "#4F46E5") for m in members}
+    # color mapping by member color, keyed by the displayed label
+    label_to_color = {_display_label(m): m.get("color", "#4F46E5") for m in members}
     domain = list(df.columns)
-    range_colors = [name_to_color.get(name, "#4F46E5") for name in domain]
+    range_colors = [label_to_color.get(lbl, "#4F46E5") for lbl in domain]
     x_field = df.index.name
     base = alt.Chart(long).encode(
         x=alt.X(f"{x_field}:T" if x_field=="תאריך" else f"{x_field}:Q", title=x_field),
@@ -384,14 +332,8 @@ def altair_personal_chart(df: pd.DataFrame, color: str):
 
 # ---------------- App ----------------
 st.set_page_config(page_title="בזק • בונוס מכירות – מוקד תמיכה", page_icon="📊", layout="wide")
-inject_base_css()
 
-if "theme_light" not in st.session_state:
-    st.session_state.theme_light = True
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-with st.sidebar:
+def inject_base_css():
     st.markdown("""
     <style>
     :root { --sidebar-width: 18rem; }
@@ -407,6 +349,14 @@ with st.sidebar:
     </style>
     """, unsafe_allow_html=True)
 
+inject_base_css()
+
+if "theme_light" not in st.session_state:
+    st.session_state.theme_light = True
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+with st.sidebar:
     if st.session_state.user:
         _u = st.session_state.user
         role_html = '<span class="role-badge">👑 אדמין</span>' if _u.get("is_admin", False) else ""
@@ -461,7 +411,7 @@ with st.sidebar:
             if st.button("עדכון סיסמה", use_container_width=True):
                 user = st.session_state.user
                 if not old_pwd or not new_pwd or not new_pwd2:
-                    st.error("נא למלא את כל שדות הסיסמה.")
+                    st.error("נא למלא את כל השדות.")
                 elif new_pwd != new_pwd2:
                     st.error("האימות של הסיסמה החדשה נכשל.")
                 elif not check_password(old_pwd, user["password"]):
@@ -489,8 +439,14 @@ with st.sidebar:
     else:
         st.info("התחבר/י כדי לראות הגדרות.")
 
-begin_skin(st.session_state.theme_light)
+# Skin wrappers
+def begin_skin(light: bool):
+    klass = "light app-skin" if light else "app-skin"
+    st.markdown(f'<div class="{klass}">', unsafe_allow_html=True)
+def end_skin():
+    st.markdown("</div>", unsafe_allow_html=True)
 
+begin_skin(st.session_state.theme_light)
 st.title("📊 בזק • מערכת בונוסים למוקד תמיכה")
 
 # -------- Auth Views --------
@@ -538,13 +494,15 @@ refresh_user()
 user = st.session_state.user
 
 # Top badge
-badge_html = f"""
+st.markdown(
+    f"""
 <div style="display:flex; justify-content:flex-end; align-items:center; gap:.75rem; padding:.25rem 0;">
   <div style="font-size:1.1rem; font-weight:700;">{user['name']} &middot; צוות {user['team']}</div>
-  <span class="dot" style="width:14px;height:14px;background:{user.get('color','#4F46E5')};display:inline-block;border-radius:999px;"></span>
+  <span class="dot" style="width:14px;height:14px;background:{user.get("color","#4F46E5")};display:inline-block;border-radius:999px;"></span>
 </div>
-"""
-st.markdown(badge_html, unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # -------- Tabs --------
 tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא"]
@@ -604,8 +562,26 @@ with tab_prev:
 
 with tab_team:
     st.subheader("דשבורד צוותי")
-    st.caption("משתמשים שסימנו 'בלתי נראה' לא יוצגו כאן.")
+    st.caption("ברירת מחדל: משתמש רגיל רואה רק את הצוות שלו. אדמין יכול לבחור צוות או 'כולם', וגם לכלול משתמשים בלתי נראים.")
+
     period = st.selectbox("טווח", ["היום", "שבוע נוכחי", "חודש נוכחי"], index=0)
+
+    # Admin-only team selector + show invisible
+    include_invisible = False
+    selected_team_key = user["team"]
+    if user.get("is_admin"):
+        dbu = load_users()
+        teams = sorted({u.get("team","") for u in dbu.get("users",{}).values() if u.get("team")})
+        teams_options = ["כל הצוותים"] + teams
+        csel1, csel2 = st.columns([2,1])
+        selected_label = csel1.selectbox("בחר צוות לתצוגה (אדמין)", options=teams_options, index=teams_options.index(user["team"]) if user["team"] in teams else 0)
+        include_invisible = csel2.checkbox("כולל 'בלתי נראה' (אדמין)", value=False)
+        selected_team_key = "ALL" if selected_label == "כל הצוותים" else selected_label
+    else:
+        selected_team_key = user["team"]
+        include_invisible = False
+
+    # Date range by period
     today = now_ij().date()
     if period == "היום":
         start_d = end_d = today
@@ -614,37 +590,48 @@ with tab_team:
     else:
         start_d, end_d = month_bounds(today)
 
-    members, totals = team_aggregate(user["team"], start_d, end_d, include_invisible=False)
+    # Build members & totals
+    if selected_team_key == "ALL":
+        members = group_members_by_filter("ALL", include_invisible=include_invisible)
+        members = [m for m in members if m.get("email") and m.get("name")]
+        totals = {m["email"]: aggregate_user(m["email"], start_d, end_d) for m in members}
+        label_for_header = "כל הצוותים"
+    else:
+        members, totals = team_aggregate(selected_team_key, start_d, end_d, include_invisible=include_invisible)
+        label_for_header = f"צוות {selected_team_key}"
 
-    # Table (no email column) + column selector
-    header = ["שם", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
+    st.markdown(f"**תצוגה:** {label_for_header}  •  טווח: {period}  •  {'כולל בלתי נראים' if include_invisible else 'ללא בלתי נראים'}")
+
+    # Table
+    header = ["שם", "צוות", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
     rows = []
     for m in members:
         counts = totals.get(m["email"], {p["code"]: 0 for p in PRODUCTS})
         b = compute_bonus(counts)
         total_items = sum(counts.values())
-        row = [m["name"], b, total_items] + [counts.get(p["code"], 0) for p in PRODUCTS]
+        row = [m["name"], m.get("team",""), b, total_items] + [counts.get(p["code"], 0) for p in PRODUCTS]
         rows.append(row)
     if rows:
         df_table_full = pd.DataFrame(rows, columns=header)
-        selected_cols = st.multiselect("בחר עמודות להצגה בטבלה", options=header, default=header, key="team_table_columns_select")
+        selected_cols = st.multiselect("בחר עמודות להצגה בטבלה", options=header, default=header, key="team_table_columns_select_adminaware")
         df_table = df_table_full[selected_cols] if selected_cols else df_table_full
         st.dataframe(df_table, use_container_width=True, hide_index=True)
 
         buff = io.StringIO(); df_table_full.to_csv(buff, index=False, quoting=csv.QUOTE_NONNUMERIC)
         st.download_button("הורדת CSV צוותי", data=buff.getvalue().encode("utf-8-sig"),
-                           file_name=f"team_{user['team']}_{start_d}_{end_d}.csv", mime="text/csv")
+                           file_name=f"team_{label_for_header}_{start_d}_{end_d}.csv", mime="text/csv")
     else:
         st.info("אין נתונים להצגה עבור הטווח.")
 
-    st.markdown("### 📈 גרף צוות – בונוס לפי זמן")
-    df_series = build_team_timeseries(user["team"], period)
+    # Chart — legend always shows team next to name
+    st.markdown("### 📈 גרף בונוס לפי זמן")
+    df_series = build_group_timeseries(members, period)
     if df_series.empty:
         st.info("אין עדיין נתונים לגרף בטווח שנבחר.")
     else:
         cumulative = st.toggle("הצג מצטבר", value=True, help="סיכום מצטבר לאורך הציר")
         to_plot = df_series.cumsum() if cumulative else df_series
-        chart = altair_team_chart(to_plot, user["team"])
+        chart = altair_group_chart(to_plot, members)
         if chart:
             st.altair_chart(chart, use_container_width=True)
 
@@ -684,19 +671,42 @@ with tab_reports:
             st.info("אין נתונים בטווח שנבחר.")
 
         st.markdown("### 📈 גרף אישי לטווח הנבחר")
-        ts_df = build_personal_timeseries(user["email"], start_d, end_d)
-        chart = altair_personal_chart(ts_df, color=user.get("color", "#4F46E5"))
-        if chart:
+        recs = load_records()["records"]
+        rows_ts = []
+        if start_d == end_d:
+            for r in recs:
+                if r["email"] == user["email"] and r["date"] == start_d.isoformat():
+                    try:
+                        ts = datetime.fromisoformat(r["ts"]).astimezone(APP_TZ)
+                        bucket = ts.hour
+                    except Exception:
+                        bucket = 0
+                    bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
+                    rows_ts.append({"bucket": bucket, "בונוס": bonus})
+            idx = pd.Index(range(24), name="שעה")
+        else:
+            for r in recs:
+                if r["email"] == user["email"] and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+                    bucket = date.fromisoformat(r["date"])
+                    bonus = int(r["qty"]) * int(PRODUCT_INDEX[r["product"]]["bonus"])
+                    rows_ts.append({"bucket": bucket, "בונוס": bonus})
+            idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
+        if rows_ts:
+            dfp = pd.DataFrame(rows_ts).groupby("bucket", as_index=True)["בונוס"].sum().reindex(idx, fill_value=0).to_frame()
+            chart = alt.Chart(dfp.reset_index().rename(columns={dfp.index.name:"bucket"})).mark_line(point=True, color=user.get("color","#4F46E5")).encode(
+                x=alt.X(f"bucket:{'T' if dfp.index.name=='תאריך' else 'Q'}", title=dfp.index.name),
+                y=alt.Y("בונוס:Q", title="בונוס (₪)")
+            ).properties(width="container")
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("אין נתונים לגרף.")
 
-# ------------- Admin Dashboard -------------
+# ------------- Admin Dashboard (as in previous versions) -------------
 if user.get("is_admin") and maybe_admin:
     tab_admin = maybe_admin[0]
     with tab_admin:
         st.header("👑 ניהול משתמשים (אדמין)")
-        st.caption("שינוי הרשאות אדמין נעשה **רק** בעריכת הקובץ data/users.json (כדרישתך). כאן אפשר למחוק, לערוך פרופיל, לאפס סיסמה ולסנן משתמשים.")
+        st.caption("שינוי הרשאות אדמין נעשה **רק** בעריכת הקובץ data/users.json. כאן ניתן למחוק, לערוך פרופיל, לאפס סיסמה ולסנן משתמשים.")
 
         db = load_users()
         all_users = list(db.get("users", {}).values())
@@ -745,7 +755,7 @@ if user.get("is_admin") and maybe_admin:
         st.markdown("---")
         # Per-user editors
         for u in filtered:
-            with st.expander(f"✏️ {u.get('name',' ללא שם')}  •  {u.get('email','')}  •  צוות {u.get('team','לא מוגדר')}"):
+            with st.expander(f"✏️ {u.get('name','ללא שם')}  •  {u.get('email','')}  •  צוות {u.get('team','לא מוגדר')}"):
                 col1, col2 = st.columns(2)
                 with col1:
                     new_name = st.text_input("שם", value=u.get("name",""), key=f"name_{u['email']}")
@@ -772,7 +782,6 @@ if user.get("is_admin") and maybe_admin:
                     st.success("נשמר.") if ok else st.error(msg)
                     st.rerun()
 
-                # Reset password
                 with cB.popover("איפוס סיסמה"):
                     np1 = st.text_input("סיסמה חדשה", type="password", key=f"np1_{u['email']}")
                     np2 = st.text_input("אימות סיסמה חדשה", type="password", key=f"np2_{u['email']}")
@@ -785,7 +794,6 @@ if user.get("is_admin") and maybe_admin:
                             ok, msg = update_user(u["email"], password=hash_password(np1))
                             st.success("סיסמה אופסה.") if ok else st.error(msg)
 
-                # Delete user
                 with cC.popover("🗑️ מחיקת משתמש"):
                     st.warning("הפעולה תמחק את המשתמש **וכל ההיסטוריה** שלו לצמיתות.")
                     chk = st.checkbox("אני מאשר/ת מחיקה", key=f"delchk_{u['email']}")
