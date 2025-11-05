@@ -643,22 +643,42 @@ with tab_team:
 
     members, totals = team_aggregate(user["team"], start_d, end_d, include_invisible=False)
 
-    header = ["שם", "אימייל", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
+    
+    # --- טבלת צוות: הסרת עמודת אימייל + בחירת עמודות מוצגות ---
+    header = ["שם", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
     rows = []
     for m in members:
         counts = totals.get(m["email"], {p["code"]: 0 for p in PRODUCTS})
         b = compute_bonus(counts)
         total_items = sum(counts.values())
-        row = [m["name"], m["email"], b, total_items] + [counts.get(p["code"], 0) for p in PRODUCTS]
+        row = [m["name"], b, total_items] + [counts.get(p["code"], 0) for p in PRODUCTS]
         rows.append(row)
     if rows:
-        df_table = pd.DataFrame(rows, columns=header)
+        df_table_full = pd.DataFrame(rows, columns=header)
+
+        # בחירת עמודות להצגה (ברירת מחדל – כל העמודות)
+        selected_cols = st.multiselect(
+            "בחר עמודות להצגה בטבלת הדשבורד הצוותי",
+            options=header,
+            default=header,
+            key="team_table_columns_select"
+        )
+        df_table = df_table_full[selected_cols] if selected_cols else df_table_full
+
         st.dataframe(df_table, use_container_width=True, hide_index=True)
-        buff = io.StringIO(); df_table.to_csv(buff, index=False, quoting=csv.QUOTE_NONNUMERIC)
-        st.download_button("הורדת CSV צוותי", data=buff.getvalue().encode("utf-8-sig"),
-                           file_name=f"team_{user['team']}_{start_d}_{end_d}.csv", mime="text/csv")
+
+        # הורדה תמיד של כל העמודות (ללא אימייל)
+        buff = io.StringIO()
+        df_table_full.to_csv(buff, index=False, quoting=csv.QUOTE_NONNUMERIC)
+        st.download_button(
+            "הורדת CSV צוותי",
+            data=buff.getvalue().encode("utf-8-sig"),
+            file_name=f"team_{user['team']}_{start_d}_{end_d}.csv",
+            mime="text/csv"
+        )
     else:
         st.info("אין נתונים להצגה עבור הטווח.")
+
 
     st.markdown("### 📈 גרף צוות – בונוס לפי זמן (עם צבעי משתמשים קבועים)")
     df_series = build_team_timeseries(user["team"], period)
