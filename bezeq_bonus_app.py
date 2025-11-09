@@ -1,11 +1,11 @@
-# bezeq_bonus_app_version 7.py
+
+# bezeq_bonus_app_version 8 (Firebase optional)
 # -*- coding: utf-8 -*-
-import json, csv, io, sys, subprocess, random, uuid
+import json, csv, io, sys, subprocess, random, uuid, os, tempfile
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-# --- Ensure required packages (pandas REQUIRED) ---
 def ensure(pkg):
     try:
         __import__(pkg)
@@ -33,12 +33,65 @@ if HAS_BCRYPT:
 else:
     bcrypt = None
 
+FIREBASE_ENABLED = False
+DB = None
+FIREBASE_DIAG = {"ok": False, "error": "not-initialized", "source": None, "project_id": None}
+
+def init_firebase():
+    global FIREBASE_ENABLED, DB, FIREBASE_DIAG
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        if not firebase_admin._apps:
+            cred_dict = None
+            try:
+                if "FIREBASE" in st.secrets:
+                    cred_dict = dict(st.secrets["FIREBASE"])
+            except Exception:
+                pass
+            if cred_dict is None:
+                fj = os.environ.get("FIREBASE_JSON")
+                if fj:
+                    try:
+                        cred_dict = json.loads(fj)
+                    except Exception:
+                        pass
+            if cred_dict is not None:
+                cred = credentials.Certificate(cred_dict)
+                FIREBASE_DIAG["source"] = "st.secrets[FIREBASE]"
+                firebase_admin.initialize_app(cred)
+            else:
+                gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+                if gac and Path(gac).exists():
+                    cred = credentials.Certificate(gac)
+                    FIREBASE_DIAG["source"] = "GOOGLE_APPLICATION_CREDENTIALS"
+                    firebase_admin.initialize_app(cred)
+                else:
+                    local = Path("firebase_service_account.json")
+                    if local.exists():
+                        cred = credentials.Certificate(str(local))
+                        FIREBASE_DIAG["source"] = "firebase_service_account.json file"
+                        firebase_admin.initialize_app(cred)
+        from firebase_admin import firestore
+        DB = firestore.client()
+        FIREBASE_ENABLED = True
+        try:
+            FIREBASE_DIAG = {"ok": True, "error": None, "source": FIREBASE_DIAG.get("source"), "project_id": st.secrets.get("FIREBASE",{}).get("project_id") if "FIREBASE" in st.secrets else None}
+        except Exception:
+            FIREBASE_DIAG = {"ok": True, "error": None, "source": FIREBASE_DIAG.get("source"), "project_id": None}
+    except Exception as e:
+        FIREBASE_ENABLED = False
+        DB = None
+        FIREBASE_DIAG = {"ok": False, "error": str(e), "source": FIREBASE_DIAG.get("source"), "project_id": None}
+
+init_firebase()
+
 APP_TZ = ZoneInfo("Asia/Jerusalem")
 DATA_DIR = Path("data")
 USERS_PATH = DATA_DIR / "users.json"
 RECORDS_PATH = DATA_DIR / "records.json"
-BONUSES_PATH = DATA_DIR / "bonuses.json"   # היסטוריית בונוסים לפי תאריך
-MSGS_PATH = DATA_DIR / "messages.json"     # הודעות מערכת/פקודות לאדמין
+BONUSES_PATH = DATA_DIR / "bonuses.json"
+MSGS_PATH = DATA_DIR / "messages.json"
 
 PRODUCTS = [
     {"code": "fiber_new", "name": "אינטרנט סיבים חדש", "bonus": 23},
@@ -54,7 +107,6 @@ PRODUCTS = [
 ]
 PRODUCT_INDEX = {p["code"]: p for p in PRODUCTS}
 
-# ---------------- Storage ----------------
 def ensure_files():
     DATA_DIR.mkdir(exist_ok=True)
     if not USERS_PATH.exists():
@@ -64,6 +116,7 @@ def ensure_files():
     if not BONUSES_PATH.exists():
         base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
         BONUSES_PATH.write_text(json.dumps({
+            "products": PRODUCTS,
             "schedules": [
                 {"effective_date": "1970-01-01", "prices": base_prices}
             ]
@@ -71,25 +124,130 @@ def ensure_files():
     if not MSGS_PATH.exists():
         MSGS_PATH.write_text(json.dumps({"messages": []}, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def _fs_users_load():
+    assert FIREBASE_ENABLED and DB
+    docs = DB.collection("users").stream()
+    users = {}
+    for d in docs:
+        u = d.to_dict() or {}
+        if "email" not in u:
+            u["email"] = d.id
+        users[u["email"].lower()] = u
+    return {"users": users}
+
+def _fs_users_save(data: dict):
+    assert FIREBASE_ENABLED and DB
+    users = data.get("users", {})
+    batch = DB.batch()
+    col = DB.collection("users")
+    for email, u in users.items():
+        doc = col.document(email)
+        u2 = dict(u); u2["email"] = email
+        batch.set(doc, u2, merge=True)
+    batch.commit()
+
+def _fs_records_load():
+    assert FIREBASE_ENABLED and DB
+    docs = DB.collection("records").stream()
+    rows = []
+    for d in docs:
+        r = d.to_dict() or {}
+        if {"email","date","product","qty","ts"} <= set(r.keys()):
+            rows.append(r)
+    return {"records": rows}
+
+def _fs_records_replace_all(data: dict):
+    assert FIREBASE_ENABLED and DB
+    recs = data.get("records", [])
+    batch = DB.batch()
+    col = DB.collection("records")
+    for r in recs:
+        rid = r.get("id") or str(uuid.uuid4())
+        batch.set(col.document(rid), r, merge=True)
+    batch.commit()
+
+def _fs_records_delete_for_user_date(email: str, date_s: str):
+    assert FIREBASE_ENABLED and DB
+    col = DB.collection("records")
+    q = col.where("email", "==", email).where("date", "==", date_s).stream()
+    batch = DB.batch()
+    any_doc = False
+    for d in q:
+        batch.delete(d.reference)
+        any_doc = True
+    if any_doc:
+        batch.commit()
+
+def _fs_bonus_load():
+    assert FIREBASE_ENABLED and DB
+    doc = DB.collection("config").document("bonuses").get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        if "schedules" in data:
+            return {"schedules": list(data["schedules"])}
+    base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
+    return {"schedules": [{"effective_date": "1970-01-01", "prices": base_prices}]}
+
+def _fs_bonus_save(data: dict):
+    assert FIREBASE_ENABLED and DB
+    data2 = {"schedules": list(data.get("schedules", []))}
+    DB.collection("config").document("bonuses").set(data2, merge=True)
+
+def _fs_messages_load():
+    assert FIREBASE_ENABLED and DB
+    docs = DB.collection("messages").order_by("created_at").stream()
+    msgs = []
+    for d in docs:
+        m = d.to_dict() or {}
+        if "id" not in m:
+            m["id"] = d.id
+        msgs.append(m)
+    return {"messages": msgs}
+
+def _fs_messages_save(data: dict):
+    assert FIREBASE_ENABLED and DB
+    msgs = data.get("messages", [])
+    batch = DB.batch()
+    col = DB.collection("messages")
+    for m in msgs:
+        mid = m.get("id") or str(uuid.uuid4())
+        m2 = dict(m); m2["id"] = mid
+        batch.set(col.document(mid), m2, merge=True)
+    batch.commit()
+
 def load_users():
+    if FIREBASE_ENABLED:
+        return _fs_users_load()
     ensure_files()
     with open(USERS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_users(data):
+    if FIREBASE_ENABLED:
+        _fs_users_save(data)
+        return
     with open(USERS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def load_records():
+    if FIREBASE_ENABLED:
+        return _fs_records_load()
     ensure_files()
     with open(RECORDS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_records(data):
+    if FIREBASE_ENABLED:
+        _fs_records_replace_all(data)
+        return
     with open(RECORDS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def load_bonus_schedules():
+    if FIREBASE_ENABLED:
+        data = _fs_bonus_load()
+        data["schedules"].sort(key=lambda s: s["effective_date"])
+        return data
     ensure_files()
     with open(BONUSES_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -98,25 +256,96 @@ def load_bonus_schedules():
 
 def save_bonus_schedules(data):
     data["schedules"].sort(key=lambda s: s["effective_date"])
+    if FIREBASE_ENABLED:
+        _fs_bonus_save(data)
+        return
     with open(BONUSES_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+# --- Extended bonus config helpers (products + schedules) ---
+def load_bonus_config():
+    if FIREBASE_ENABLED:
+        doc = DB.collection("config").document("bonuses").get()
+        data = doc.to_dict() or {}
+        if "schedules" not in data:
+            base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
+            data["schedules"] = [{"effective_date": "1970-01-01", "prices": base_prices}]
+        if "products" not in data or not data["products"]:
+            data["products"] = list(PRODUCTS)
+        try:
+            data["schedules"].sort(key=lambda s: s["effective_date"])
+        except Exception:
+            pass
+        return data
+    ensure_files()
+    try:
+        with open(BONUSES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if "schedules" not in data:
+        base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
+        data["schedules"] = [{"effective_date": "1970-01-01", "prices": base_prices}]
+    if "products" not in data or not data["products"]:
+        data["products"] = list(PRODUCTS)
+    try:
+        data["schedules"].sort(key=lambda s: s["effective_date"])
+    except Exception:
+        pass
+    return data
+
+def save_bonus_config(data: dict):
+    data = dict(data)
+    schedules = list(data.get("schedules", []))
+    try:
+        schedules.sort(key=lambda s: s["effective_date"])
+    except Exception:
+        pass
+    products = list(data.get("products", []))
+    data2 = {"schedules": schedules, "products": products}
+    if FIREBASE_ENABLED:
+        DB.collection("config").document("bonuses").set(data2, merge=True)
+        return
+    with open(BONUSES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data2, f, ensure_ascii=False, indent=2)
+
+def load_products():
+    cfg = load_bonus_config()
+    return list(cfg.get("products", [])) or list(PRODUCTS)
+
+def save_products(products: list):
+    cfg = load_bonus_config()
+    cfg["products"] = list(products)
+    save_bonus_config(cfg)
+
+def refresh_products():
+    global PRODUCTS, PRODUCT_INDEX
+    try:
+        prods = load_products()
+        if prods:
+            PRODUCTS = list(prods)
+            PRODUCT_INDEX = {p["code"]: p for p in PRODUCTS}
+    except Exception:
+        PRODUCT_INDEX = {p["code"]: p for p in PRODUCTS}
+
+# Refresh at import-time so UI and calculations use latest product set
+refresh_products()
+
 
 def load_messages():
+    if FIREBASE_ENABLED:
+        return _fs_messages_load()
     ensure_files()
     with open(MSGS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_messages(data):
+    if FIREBASE_ENABLED:
+        _fs_messages_save(data)
+        return
     with open(MSGS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ---------------- Messages / POPUP logic ----------------
-def create_message(text: str, target_all: bool, target_emails: list[str], target_teams: list[str], sticky: bool=True, meta: dict|None=None, title: str|None=None):
-    """Create a system message. 
-    sticky=True keeps the popup until the user closes it. 
-    Each user sees it once; dismissal stored in 'dismissed_for' list of emails.
-    """
-    data = load_messages()
+def create_message(text: str, target_all: bool, target_emails: list, target_teams: list, sticky: bool=True, meta: dict|None=None, title: str|None=None, sender: str|None=None):
     msg = {
         "id": str(uuid.uuid4()),
         "title": title or "הודעה",
@@ -129,12 +358,21 @@ def create_message(text: str, target_all: bool, target_emails: list[str], target
         "sticky": bool(sticky),
         "dismissed_for": [],
         "meta": meta or {},
+        "sender": (sender or "system"),
     }
+    if FIREBASE_ENABLED:
+        DB.collection("messages").document(msg["id"]).set(msg, merge=True)
+        return msg["id"]
+    data = load_messages()
     data["messages"].append(msg)
     save_messages(data)
     return msg["id"]
 
 def update_message(msg_id: str, **fields):
+    if FIREBASE_ENABLED:
+        allowed = {k:v for k,v in fields.items() if k in {"text","target_all","target_emails","target_teams","active","sticky","meta"}}
+        DB.collection("messages").document(msg_id).set(allowed, merge=True)
+        return True
     data = load_messages()
     for m in data["messages"]:
         if m["id"] == msg_id:
@@ -144,45 +382,52 @@ def update_message(msg_id: str, **fields):
     return False
 
 def delete_message(msg_id: str):
+    if FIREBASE_ENABLED:
+        DB.collection("messages").document(msg_id).delete()
+        return
     data = load_messages()
     data["messages"] = [m for m in data["messages"] if m["id"] != msg_id]
     save_messages(data)
 
 def eligible_messages_for_user(user: dict):
-    """Return active messages the user hasn't dismissed and that target them."""
-    data = load_messages()
+    md = load_messages()
     msgs = []
     email = user["email"].lower().strip()
     team = user.get("team","")
-    for m in data["messages"]:
+    for m in md.get("messages", []):
         if not m.get("active", True):
             continue
         if email in m.get("dismissed_for", []):
             continue
         if m.get("target_all"):
-            msgs.append(m)
-            continue
+            msgs.append(m); continue
         if email in [e.lower() for e in m.get("target_emails", [])]:
-            msgs.append(m)
-            continue
+            msgs.append(m); continue
         if team and team in m.get("target_teams", []):
-            msgs.append(m)
-            continue
-    # order by created_at ascending
+            msgs.append(m); continue
     msgs.sort(key=lambda x: x.get("created_at",""))
     return msgs
 
 def mark_dismissed_for_user(msg_id: str, user_email: str):
+    user_email = user_email.lower().strip()
+    if FIREBASE_ENABLED:
+        ref = DB.collection("messages").document(msg_id)
+        snap = ref.get()
+        if snap.exists:
+            m = snap.to_dict() or {}
+            lst = set(m.get("dismissed_for", []))
+            lst.add(user_email)
+            ref.set({"dismissed_for": sorted(lst)}, merge=True)
+        return
     data = load_messages()
     for m in data["messages"]:
         if m["id"] == msg_id:
             lst = set(m.get("dismissed_for", []))
-            lst.add(user_email.lower().strip())
+            lst.add(user_email)
             m["dismissed_for"] = sorted(lst)
             break
     save_messages(data)
 
-# ---------------- Bonus price lookup ----------------
 def get_bonus_for(product_code: str, on_date: str | date) -> int:
     if isinstance(on_date, date):
         d = on_date
@@ -199,7 +444,6 @@ def get_bonus_for(product_code: str, on_date: str | date) -> int:
     prices = (applicable or schedules[0])["prices"]
     return int(prices.get(product_code, PRODUCT_INDEX.get(product_code, {}).get("bonus", 0)))
 
-# ---------------- Auth ----------------
 def hash_password(password: str) -> str:
     if not bcrypt:
         import hashlib, secrets
@@ -222,12 +466,11 @@ def check_password(password: str, hashed: str) -> bool:
     except Exception:
         return False
 
-# ---------------- Time helpers ----------------
 def now_ij():
     return datetime.now(APP_TZ)
 
 def week_bounds(d: date):
-    weekday = (d.weekday() + 1) % 7  # Sunday=0
+    weekday = (d.weekday() + 1) % 7
     start = d - timedelta(days=weekday)
     end = start + timedelta(days=6)
     return start, end
@@ -247,7 +490,6 @@ def fmt_ts(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts)
         try:
-            # if tz-aware, normalize to app TZ
             dt = dt.astimezone(APP_TZ)
         except Exception:
             pass
@@ -255,8 +497,6 @@ def fmt_ts(ts: str) -> str:
     except Exception:
         return ts
 
-
-# ---------------- Users helpers ----------------
 def _random_hex_color(existing: set[str]):
     while True:
         h = random.randint(0, 359)
@@ -281,16 +521,20 @@ def new_user_payload(name, email, password, team, invisible=False):
         "created_at": now_ij().isoformat(),
         "goals": {"daily": 0, "weekly": 0, "monthly": 0},
         "color": color,
-        "is_admin": False  # admin only via JSON edit
+        "is_admin": False
     }
 
 def register_user(name, email, password, team, invisible):
-    db = load_users()
+    dbu = load_users()
     email_l = email.lower().strip()
-    if email_l in db["users"]:
+    if email_l in dbu["users"]:
         return False, "האימייל כבר רשום במערכת."
-    db["users"][email_l] = new_user_payload(name, email_l, password, team, invisible)
-    save_users(db)
+    payload = new_user_payload(name, email_l, password, team, invisible)
+    if FIREBASE_ENABLED:
+        DB.collection("users").document(email_l).set(payload, merge=True)
+        return True, "נרשמת בהצלחה! אפשר להתחבר."
+    dbu["users"][email_l] = payload
+    save_users(dbu)
     return True, "נרשמת בהצלחה! אפשר להתחבר."
 
 def authenticate(email, password):
@@ -303,18 +547,33 @@ def authenticate(email, password):
     return True, user
 
 def update_user(email, **fields):
+    if "is_admin" in fields:
+        fields.pop("is_admin")
+    if FIREBASE_ENABLED:
+        email_l = email.lower().strip()
+        DB.collection("users").document(email_l).set(fields, merge=True)
+        return True, "עודכן בהצלחה."
     db = load_users()
     user = db["users"].get(email.lower().strip())
     if not user:
         return False, "משתמש לא נמצא."
-    if "is_admin" in fields:  # never from UI
-        fields.pop("is_admin")
     user.update(fields)
     db["users"][email.lower().strip()] = user
     save_users(db)
     return True, "עודכן בהצלחה."
 
 def delete_user(email):
+    if FIREBASE_ENABLED:
+        email_l = email.lower().strip()
+        DB.collection("users").document(email_l).delete()
+        q = DB.collection("records").where("email", "==", email_l).stream()
+        batch = DB.batch()
+        anyd = False
+        for d in q:
+            batch.delete(d.reference); anyd = True
+        if anyd:
+            batch.commit()
+        return True
     dbu = load_users()
     dbr = load_records()
     if email in dbu["users"]:
@@ -324,12 +583,22 @@ def delete_user(email):
     save_records(dbr)
     return True
 
-# ---------------- Records & Aggregations ----------------
 def add_or_set_counts(email: str, d: date, counts: dict):
-    db = load_records()
     date_s = d.isoformat()
-    db["records"] = [r for r in db["records"] if not (r["email"] == email and r["date"] == date_s)]
     ts = now_ij().isoformat()
+    if FIREBASE_ENABLED:
+        _fs_records_delete_for_user_date(email, date_s)
+        batch = DB.batch()
+        col = DB.collection("records")
+        for code, qty in counts.items():
+            qty = int(qty)
+            if qty > 0:
+                rid = str(uuid.uuid4())
+                batch.set(col.document(rid), {"email": email, "date": date_s, "product": code, "qty": qty, "ts": ts}, merge=True)
+        batch.commit()
+        return
+    db = load_records()
+    db["records"] = [r for r in db["records"] if not (r["email"] == email and r["date"] == date_s)]
     for code, qty in counts.items():
         qty = int(qty)
         if qty > 0:
@@ -337,8 +606,15 @@ def add_or_set_counts(email: str, d: date, counts: dict):
     save_records(db)
 
 def get_counts_for_user_date(email: str, d: date):
-    db = load_records()
     date_s = d.isoformat()
+    if FIREBASE_ENABLED:
+        q = DB.collection("records").where("email","==",email).where("date","==",date_s).stream()
+        out = {p["code"]: 0 for p in PRODUCTS}
+        for doc in q:
+            r = doc.to_dict() or {}
+            out[r.get("product","")] = out.get(r.get("product",""),0) + int(r.get("qty",0))
+        return out
+    db = load_records()
     out = {p["code"]: 0 for p in PRODUCTS}
     for r in db["records"]:
         if r["email"] == email and r["date"] == date_s:
@@ -346,24 +622,36 @@ def get_counts_for_user_date(email: str, d: date):
     return out
 
 def aggregate_user_counts(email: str, start_d: date, end_d: date):
+    s = start_d.isoformat(); e = end_d.isoformat()
+    if FIREBASE_ENABLED:
+        q = DB.collection("records").where("email","==",email).where("date",">=",s).where("date","<=",e).stream()
+        out = {p["code"]: 0 for p in PRODUCTS}
+        for doc in q:
+            r = doc.to_dict() or {}
+            out[r.get("product","")] = out.get(r.get("product",""),0) + int(r.get("qty",0))
+        return out
     db = load_records()
     out = {p["code"]: 0 for p in PRODUCTS}
-    s = start_d.isoformat(); e = end_d.isoformat()
     for r in db["records"]:
         if r["email"] == email and s <= r["date"] <= e:
             out[r["product"]] = out.get(r["product"], 0) + int(r["qty"])
     return out
 
 def sum_bonus_for_email_range(email: str, start_d: date, end_d: date) -> int:
-    db = load_records()
     s = start_d.isoformat(); e = end_d.isoformat()
     total = 0
+    if FIREBASE_ENABLED:
+        q = DB.collection("records").where("email","==",email).where("date",">=",s).where("date","<=",e).stream()
+        for doc in q:
+            r = doc.to_dict() or {}
+            total += int(r.get("qty",0)) * get_bonus_for(r.get("product",""), r.get("date", s))
+        return int(total)
+    db = load_records()
     for r in db["records"]:
         if r["email"] == email and s <= r["date"] <= e:
             total += int(r["qty"]) * get_bonus_for(r["product"], r["date"])
     return int(total)
 
-# --------- Group helpers ---------
 def all_users_list(include_invisible=True):
     db = load_users()
     users = list(db.get("users", {}).values())
@@ -390,14 +678,42 @@ def _display_label(member: dict) -> str:
     team = member.get("team","")
     return f"{name} · {team}" if team else name
 
-def build_group_timeseries(members: list, period: str) -> pd.DataFrame:
+def build_group_timeseries(members: list, period: str, start_d: date | None = None, end_d: date | None = None) -> pd.DataFrame:
     if not members:
         return pd.DataFrame()
     email_to_label = {m["email"]: _display_label(m) for m in members}
-    recs = load_records()["records"]
+    # Support custom explicit start/end if provided
+    custom = (period == "CUSTOM") or (start_d is not None and end_d is not None)
+    if custom and (start_d is None or end_d is None):
+        today = now_ij().date()
+        start_d = today
+        end_d = today
+
+    if FIREBASE_ENABLED:
+        today = now_ij().date()
+        if custom:
+            s = start_d.isoformat(); e = end_d.isoformat()
+        else:
+            start, end = today, today
+            if period == "שבוע נוכחי":
+                start, end = week_bounds(today)
+            elif period != "היום":
+                start, end = month_bounds(today)
+            s = start.isoformat(); e = end.isoformat()
+        docs = DB.collection("records").where("date", ">=", s).where("date","<=", e).stream()
+        recs = [d.to_dict() for d in docs if d.to_dict().get("email") in email_to_label]
+    else:
+        recs = load_records()["records"]
     today = now_ij().date()
     rows = []
-    if period == "היום":
+    if custom:
+        for r in recs:
+            if r["email"] in email_to_label and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+                d = date.fromisoformat(r["date"])
+                bonus = int(r.get("qty",0)) * get_bonus_for(r.get("product",""), r.get("date", start_d.isoformat()))
+                rows.append({"bucket": d, "email": r["email"], "bonus": bonus})
+        idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
+    elif period == "היום":
         target = today.isoformat()
         for r in recs:
             if r["email"] in email_to_label and r["date"] == target:
@@ -406,7 +722,7 @@ def build_group_timeseries(members: list, period: str) -> pd.DataFrame:
                     bucket = ts.hour
                 except Exception:
                     bucket = 0
-                bonus = int(r["qty"]) * get_bonus_for(r["product"], r["date"])
+                bonus = int(r.get("qty",0)) * get_bonus_for(r.get("product",""), r.get("date", target))
                 rows.append({"bucket": bucket, "email": r["email"], "bonus": bonus})
         idx = pd.Index(range(24), name="שעה")
     elif period == "שבוע נוכחי":
@@ -414,15 +730,15 @@ def build_group_timeseries(members: list, period: str) -> pd.DataFrame:
         for r in recs:
             if r["email"] in email_to_label and start_d.isoformat() <= r["date"] <= end_d.isoformat():
                 d = date.fromisoformat(r["date"])
-                bonus = int(r["qty"]) * get_bonus_for(r["product"], r["date"])
+                bonus = int(r.get("qty",0)) * get_bonus_for(r.get("product",""), r.get("date", start_d.isoformat()))
                 rows.append({"bucket": d, "email": r["email"], "bonus": bonus})
         idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
-    else:  # חודש נוכחי
+    else:
         start_d, end_d = month_bounds(today)
         for r in recs:
             if r["email"] in email_to_label and start_d.isoformat() <= r["date"] <= end_d.isoformat():
                 d = date.fromisoformat(r["date"])
-                bonus = int(r["qty"]) * get_bonus_for(r["product"], r["date"])
+                bonus = int(r.get("qty",0)) * get_bonus_for(r.get("product",""), r.get("date", start_d.isoformat()))
                 rows.append({"bucket": d, "email": r["email"], "bonus": bonus})
         idx = pd.Index([start_d + timedelta(n) for n in range((end_d-start_d).days+1)], name="תאריך")
     if not rows:
@@ -433,26 +749,7 @@ def build_group_timeseries(members: list, period: str) -> pd.DataFrame:
     df_p = df_p.reindex(idx, fill_value=0)
     return df_p
 
-# ---------------- Charts helpers ----------------
-def altair_group_chart(df: pd.DataFrame, members: list):
-    if df.empty:
-        return None
-    long = df.reset_index().melt(id_vars=df.index.name, var_name="משתמש", value_name="בונוס")
-    label_to_color = {_display_label(m): m.get("color", "#4F46E5") for m in members}
-    domain = list(df.columns)
-    range_colors = [label_to_color.get(lbl, "#4F46E5") for lbl in domain]
-    x_field = df.index.name
-    base = alt.Chart(long).encode(
-        x=alt.X(f"{x_field}:T" if x_field=="תאריך" else f"{x_field}:Q", title=x_field),
-        y=alt.Y("בונוס:Q", title="בונוס (₪)"),
-        color=alt.Color("משתמש:N", scale=alt.Scale(domain=domain, range=range_colors), legend=alt.Legend(title="משתמש"))
-    ).properties(width="container")
-    line = base.mark_line(point=False)
-    points = base.transform_filter(alt.datum.בונוס > 0).mark_circle(size=60, opacity=1)
-    return (line + points)
-
-# ---------------- App ----------------
-st.set_page_config(page_title="בזק • בונוס מכירות – מוקד תמיכה", page_icon="📊", layout="wide")
+st.set_page_config(page_title="ברדק • בונוס מכירות – מוקד תמיכה", page_icon="📊", layout="wide")
 
 def inject_base_css():
     st.markdown("""
@@ -478,8 +775,14 @@ if "theme_light" not in st.session_state:
 if "user" not in st.session_state:
     st.session_state.user = None
 
-
 with st.sidebar:
+    st.caption("📡 מצב אחסון: " + ("Firebase Firestore" if FIREBASE_ENABLED else "קבצי JSON מקומיים"))
+    with st.expander("Diagnostics"):
+        try:
+            st.json(FIREBASE_DIAG)
+        except Exception:
+            st.write("no diagnostics available")
+
     if st.session_state.user:
         _u = st.session_state.user
         role_html = '<span class="role-badge">👑 אדמין</span>' if _u.get("is_admin", False) else ""
@@ -562,17 +865,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📬 הודעות מערכת")
-    # Message Center: show unread for this user + history, allow acknowledging
     if st.session_state.user:
         user_email = st.session_state.user["email"].lower().strip()
         md = load_messages()
         msgs_all = sorted(md.get("messages", []), key=lambda m: m.get("created_at",""), reverse=True)
-        unread = []
-        read = []
+        unread, read = [], []
         team = st.session_state.user.get("team","")
         for m in msgs_all:
             if not m.get("active", True):
-                continue  # only active messages in the user panel
+                continue
             targeted = m.get("target_all") or \
                        (user_email in [e.lower() for e in m.get("target_emails", [])]) or \
                        (team and team in m.get("target_teams", []))
@@ -587,30 +888,26 @@ with st.sidebar:
         if unread and cB.button("✔️ סמן הכל כנקרא", use_container_width=True):
             for m in unread:
                 mark_dismissed_for_user(m["id"], user_email)
-            st.experimental_rerun()
+            st.rerun()
 
         if unread:
             st.markdown("#### לא נקראו")
             for m in unread:
                 with st.expander(f"{m.get('title','הודעה')} • {fmt_ts(m.get('created_at',''))}", expanded=True):
                     st.write(m.get("text",""))
-                    pass  # meta hidden
                     if st.button("סגור / קראתי", key=f"ack_{m['id']}"):
                         mark_dismissed_for_user(m["id"], user_email)
-                        st.experimental_rerun()
+                        st.rerun()
         st.markdown("#### היסטוריה")
         if read:
             for m in read[:50]:
                 with st.expander(f"{m.get('title','הודעה')} • {fmt_ts(m.get('created_at',''))}", expanded=False):
                     st.write(m.get("text",""))
-                    pass  # meta hidden
         else:
             st.caption("אין היסטוריית הודעות.")
-
     else:
         st.info("התחבר/י כדי לראות הגדרות.")
 
-# Skin wrappers
 def begin_skin(light: bool):
     klass = "light app-skin" if light else "app-skin"
     st.markdown(f'<div class="{klass}">', unsafe_allow_html=True)
@@ -618,9 +915,8 @@ def end_skin():
     st.markdown("</div>", unsafe_allow_html=True)
 
 begin_skin(st.session_state.theme_light)
-st.title("📊 בזק • מערכת בונוסים למוקד תמיכה")
+st.title("📊 ברדק • מערכת בונוסים למוקד תמיכה")
 
-# -------- Auth Views --------
 def view_auth():
     tab_login, tab_register = st.tabs(["התחברות", "הרשמה"])
     with tab_login:
@@ -664,10 +960,6 @@ def refresh_user():
 refresh_user()
 user = st.session_state.user
 
-# Show any pending POPUPs as soon as user is authenticated
-
-
-# Top badge
 st.markdown(
     f"""
 <div style="display:flex; justify-content:flex-end; align-items:center; gap:.75rem; padding:.25rem 0;">
@@ -678,13 +970,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# -------- Tabs --------
 tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא"]
 if user.get("is_admin"):
     tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)", "פקודות (אדמין)"])
 tab_today, tab_prev, tab_team, tab_reports, *maybe_admin_tabs = st.tabs(tabs)
 
-# ------ TODAY ------
 with tab_today:
     st.subheader("הזנת מכירות להיום")
     today = now_ij().date()
@@ -715,7 +1005,6 @@ with tab_today:
     y_bonus = sum(qty * get_bonus_for(code, yest) for code, qty in y_counts.items())
     c4.metric("אתמול (₪)", int(y_bonus))
 
-# ------ EDITS/HISTORY ------
 with tab_prev:
     st.subheader("תיקונים וצפייה בהיסטוריה")
     sel_date = st.date_input("בחר תאריך", value=now_ij().date(), max_value=now_ij().date())
@@ -738,15 +1027,21 @@ with tab_prev:
     c2.metric("שבוע נוכחי (₪)", sum_bonus_for_email_range(user["email"], wk_s, wk_e))
     c3.metric("חודש נוכחי (₪)", sum_bonus_for_email_range(user["email"], mo_s, mo_e))
 
-# ------ TEAM DASHBOARD ------
+
 with tab_team:
     st.subheader("דשבורד צוותי")
     st.caption("ברירת מחדל: משתמש רגיל רואה רק את הצוות שלו. אדמין יכול לבחור צוות או 'כולם', וגם לכלול משתמשים בלתי נראים.")
 
-    period = st.selectbox("טווח", ["היום", "שבוע נוכחי", "חודש נוכחי"], index=0)
+    # Period controls
+    period = st.selectbox("טווח", ["היום", "שבוע נוכחי", "חודש נוכחי", "מותאם אישית"], index=0)
+    colr1, colr2, colr3 = st.columns([1,1,1])
+    use_custom = (period == "מותאם אישית")
+    today = now_ij().date()
+    start_custom = colr2.date_input("מתאריך", value=today.replace(day=1), key="team_range_start") if use_custom else None
+    end_custom = colr3.date_input("עד תאריך", value=today, key="team_range_end") if use_custom else None
 
+    # Team selection
     include_invisible = False
-    selected_team_key = user["team"]
     if user.get("is_admin"):
         dbu = load_users()
         teams = sorted({u.get("team","") for u in dbu.get("users",{}).values() if u.get("team")})
@@ -757,16 +1052,23 @@ with tab_team:
         selected_team_key = "ALL" if selected_label == "כל הצוותים" else selected_label
     else:
         selected_team_key = user["team"]
-        include_invisible = False
 
-    today = now_ij().date()
-    if period == "היום":
-        start_d = end_d = today
-    elif period == "שבוע נוכחי":
-        start_d, end_d = week_bounds(today)
+    # Compute date range
+    if use_custom and start_custom and end_custom and start_custom <= end_custom:
+        start_d, end_d = start_custom, end_custom
+        period_label = f"{start_d} – {end_d}"
+        period_key = "CUSTOM"
     else:
-        start_d, end_d = month_bounds(today)
+        if period == "היום":
+            start_d = end_d = today
+        elif period == "שבוע נוכחי":
+            start_d, end_d = week_bounds(today)
+        else:
+            start_d, end_d = month_bounds(today)
+        period_label = period
+        period_key = period
 
+    # Aggregate
     if selected_team_key == "ALL":
         members = group_members_by_filter("ALL", include_invisible=include_invisible)
         members = [m for m in members if m.get("email") and m.get("name")]
@@ -777,9 +1079,10 @@ with tab_team:
         members, counts, bonuses = team_aggregate(selected_team_key, start_d, end_d, include_invisible=include_invisible)
         label_for_header = f"צוות {selected_team_key}"
 
-    st.markdown(f"**תצוגה:** {label_for_header}  •  טווח: {period}  •  {'כולל בלתי נראים' if include_invisible else 'ללא בלתי נראים'}")
+    st.markdown(f"**תצוגה:** {label_for_header}  •  טווח: {period_label}" + (f"  •  כולל בלתי נראים" if include_invisible and selected_team_key == "ALL" else ""))
 
-    header = ["שם", "צוות", "בונוס (₪)", "סה\"כ פריטים"] + [p["name"] for p in PRODUCTS]
+    # Table
+    header = ["שם", "צוות", "בונוס (₪)", "סהכ פריטים"] + [p["name"] for p in PRODUCTS]
     rows = []
     for m in members:
         email = m["email"]
@@ -788,55 +1091,77 @@ with tab_team:
         total_items = sum(cnt.values())
         row = [m["name"], m.get("team",""), int(b), total_items] + [cnt.get(p["code"], 0) for p in PRODUCTS]
         rows.append(row)
-    if rows:
-        df_table_full = pd.DataFrame(rows, columns=header)
-        selected_cols = st.multiselect("בחר עמודות להצגה בטבלה", options=header, default=header, key="team_table_columns_select_adminaware")
-        df_table = df_table_full[selected_cols] if selected_cols else df_table_full
-        st.dataframe(df_table, use_container_width=True, hide_index=True)
 
+    if rows:
+        import pandas as pd, io, csv, altair as alt
+        df_table_full = pd.DataFrame(rows, columns=header)
+        st.dataframe(df_table_full, use_container_width=True, hide_index=True)
         buff = io.StringIO(); df_table_full.to_csv(buff, index=False, quoting=csv.QUOTE_NONNUMERIC)
         st.download_button("הורדת CSV צוותי", data=buff.getvalue().encode("utf-8-sig"),
                            file_name=f"team_{label_for_header}_{start_d}_{end_d}.csv", mime="text/csv")
     else:
         st.info("אין נתונים להצגה עבור הטווח.")
 
+    # Chart
+    df_series = build_group_timeseries(members, period_key, start_d, end_d)
     st.markdown("### 📈 גרף בונוס לפי זמן")
-    df_series = build_group_timeseries(members, period)
-    if df_series.empty:
+    if 'pd' not in globals():
+        import pandas as pd
+    if df_series is None or (hasattr(df_series, "empty") and df_series.empty):
         st.info("אין עדיין נתונים לגרף בטווח שנבחר.")
     else:
         cumulative = st.toggle("הצג מצטבר", value=True, help="סיכום מצטבר לאורך הציר")
         to_plot = df_series.cumsum() if cumulative else df_series
-        chart = altair_group_chart(to_plot, members)
-        if chart:
-            st.altair_chart(chart, use_container_width=True)
-
-# ------ REPORTS ------
+        import altair as alt
+        chart = (alt.Chart(to_plot.reset_index().melt(id_vars=to_plot.index.name, var_name="משתמש", value_name="בונוס"))
+                 .encode(
+                    x=alt.X(f"{to_plot.index.name}:T" if to_plot.index.name=="תאריך" else f"{to_plot.index.name}:O", title=to_plot.index.name),
+                    y=alt.Y("בונוס:Q"),
+                    color=alt.Color("משתמש:N")
+                 ).mark_line())
+        st.altair_chart(chart, use_container_width=True)
 with tab_reports:
     st.subheader("דוחות אישיים וייצוא")
     today = now_ij().date()
     colA, colB = st.columns(2)
-    start_d = colA.date_input("מתאריך", value=today.replace(day=1))
-    end_d = colB.date_input("עד תאריך", value=today, max_value=today)
+    start_d = colA.date_input("מתאריך", value=today.replace(day=1), key="reports_start")
+    end_d = colB.date_input("עד תאריך", value=today, max_value=today, key="reports_end")
     if start_d > end_d:
         st.warning("טווח תאריכים שגוי.")
     else:
         b = sum_bonus_for_email_range(user["email"], start_d, end_d)
         st.markdown(f"**בונוס בטווח (₪):** {int(b)}")
-        records = load_records()["records"]
         rows = []
-        for r in records:
-            if r["email"] == user["email"] and start_d.isoformat() <= r["date"] <= end_d.isoformat():
-                price = get_bonus_for(r["product"], r["date"])
-                prod = PRODUCT_INDEX.get(r["product"], {"name": r["product"], "bonus": price})
+        if FIREBASE_ENABLED:
+            s = start_d.isoformat(); e = end_d.isoformat()
+            q = DB.collection("records").where("email","==",user["email"]).where("date",">=",s).where("date","<=",e).stream()
+            for ddoc in q:
+                r = ddoc.to_dict() or {}
+                price = get_bonus_for(r.get("product",""), r.get("date", s))
+                prod = PRODUCT_INDEX.get(r.get("product",""), {"name": r.get("product",""), "bonus": price})
                 rows.append({
-                    "תאריך": r["date"],
+                    "תאריך": r.get("date",""),
                     "מוצר": prod["name"],
-                    "כמות": int(r["qty"]),
+                    "כמות": int(r.get("qty",0)),
                     "בונוס ליחידה (לפי תאריך)": price,
-                    "סה\"כ בונוס": int(r["qty"]) * int(price),
+                    "סה\"כ בונוס": int(r.get("qty",0)) * int(price),
                     "עדכון": r.get("ts",""),
                 })
+        else:
+            records = load_records()["records"]
+            for r in records:
+                if r["email"] == user["email"] and start_d.isoformat() <= r["date"] <= end_d.isoformat():
+                    price = get_bonus_for(r["product"], r["date"])
+                    prod = PRODUCT_INDEX.get(r["product"], {"name": r["product"], "bonus": price})
+                    rows.append({
+                        "תאריך": r["date"],
+                        "מוצר": prod["name"],
+                        "כמות": int(r["qty"]),
+                        "בונוס ליחידה (לפי תאריך)": price,
+                        "סה\"כ בונוס": int(r["qty"]) * int(price),
+                        "עדכון": r.get("ts",""),
+                    })
+        import pandas as pd
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.sort_values(["תאריך","מוצר"])
@@ -847,18 +1172,15 @@ with tab_reports:
         else:
             st.info("אין נתונים בטווח שנבחר.")
 
-# ------ ADMIN: Users, Bonus Schedules, Commands ------
 if user.get("is_admin") and maybe_admin_tabs:
     tab_admin_users = maybe_admin_tabs[0]
     tab_admin_prices = maybe_admin_tabs[1]
     tab_admin_cmds = maybe_admin_tabs[2]
 
-    # --- Admin Users ---
     with tab_admin_users:
         st.header("👑 ניהול משתמשים (אדמין)")
-        st.caption("שינוי הרשאות אדמין נעשה **רק** בעריכת הקובץ data/users.json. כאן ניתן למחוק, לערוך פרופיל, לאפס סיסמה ולסנן משתמשים.")
-        db = load_users()
-        all_users = list(db.get("users", {}).values())
+        dbu = load_users()
+        all_users = list(dbu.get("users", {}).values())
         teams = sorted({u.get("team","") for u in all_users if u.get("team")})
         colf1, colf2, colf3 = st.columns([1,1,2])
         team_filter = colf1.selectbox("סינון לפי צוות", options=["כל הצוותים"] + teams, index=0)
@@ -893,6 +1215,7 @@ if user.get("is_admin") and maybe_admin_tabs:
                 "goal_monthly": u.get("goals",{}).get("monthly",0),
             })
         if export_rows:
+            import pandas as pd, io, csv
             dfu = pd.DataFrame(export_rows)
             buff = io.StringIO(); dfu.to_csv(buff, index=False, quoting=csv.QUOTE_NONNUMERIC)
             st.download_button("הורדת CSV משתמשים (מסונן)", data=buff.getvalue().encode("utf-8-sig"),
@@ -950,14 +1273,89 @@ if user.get("is_admin") and maybe_admin_tabs:
                         else:
                             st.error("יש לאשר את תיבת הסימון לפני מחיקה.")
 
-    # --- Admin Bonus Schedules ---
     with tab_admin_prices:
         st.header("👑 ניהול בונוסים לפי תאריך תחילה (אדמין)")
-        st.caption("קבע/י בונוס לכל מוצר לפי תאריך תחילה. חישובים יתבססו על המחיר שהיה בתוקף במועד המכירה.")
+
+        # --- Admin: Product management (add/delete) ---
+        st.markdown("### 🧩 ניהול מוצרים (פריטים)")
+        prods = load_products()
+        exist_codes = {p["code"] for p in prods}
+
+        with st.expander("➕ הוספת מוצר בונוס חדש", expanded=False):
+            c1, c2, c3 = st.columns([1.2, 2.0, 1.0])
+            new_code = c1.text_input("קוד מוצר (אנגלית/ספרות/קו תחתון)", placeholder="e.g. cyber_plus_pro").strip()
+            new_name = c2.text_input("שם מוצר לתצוגה").strip()
+            new_bonus = c3.number_input("בונוס ברירת מחדל (₪)", min_value=0, step=1, value=0)
+            add_now = st.button("הוסף מוצר", type="primary", use_container_width=False)
+            if add_now:
+                import re as _re
+                if not new_code or not _re.fullmatch(r"[A-Za-z0-9_\-]+", new_code):
+                    st.error("קוד מוצר חייב להיות באנגלית/ספרות/קו תחתון/מקף בלבד.")
+                elif new_code in exist_codes:
+                    st.error("קוד המוצר כבר קיים.")
+                elif not new_name:
+                    st.error("נא למלא שם מוצר.")
+                else:
+                    prods.append({"code": new_code, "name": new_name, "bonus": int(new_bonus)})
+                    save_products(prods)
+                    cfg = load_bonus_config()
+                    for sch in cfg.get("schedules", []):
+                        sch.setdefault("prices", {})
+                        if new_code not in sch["prices"]:
+                            sch["prices"][new_code] = int(new_bonus)
+                    save_bonus_config(cfg)
+                    refresh_products()
+                    st.success("המוצר נוסף בהצלחה.")
+                    st.rerun()
+
+        with st.expander("🗑️ מחיקת מוצר מהרשימה (לא פוגע בהיסטוריה)", expanded=False):
+            if not prods:
+                st.info("אין מוצרים זמינים.")
+            else:
+                c1, c2 = st.columns([2,1])
+                del_code = c1.selectbox("בחר קוד למחיקה", options=[p["code"] for p in prods], format_func=lambda c: next((f"{x['name']} — {x['code']}" for x in prods if x['code']==c), c))
+                really = c2.checkbox("מאשר/ת")
+                if st.button("מחק מוצר", type="secondary"):
+                    if not really:
+                        st.error("יש לאשר את המחיקה (תיבת סימון).")
+                    else:
+                        prods2 = [p for p in prods if p["code"] != del_code]
+                        save_products(prods2)
+                        refresh_products()
+                        st.success("המוצר הוסר מרשימת הקלט. נתוני עבר נשארים ללא שינוי")
+
+        with st.expander("✏️ שינוי שם מוצר קיים", expanded=False):
+            prods = load_products()
+            if not prods:
+                st.info("אין מוצרים לשינוי.")
+            else:
+                c1, c2 = st.columns([2, 2])
+                sel_code = c1.selectbox(
+                    "בחר קוד מוצר",
+                    options=[p["code"] for p in prods],
+                    format_func=lambda c: next((f"{x['name']} — {x['code']}" for x in prods if x['code']==c), c)
+                )
+                current_name = next((p["name"] for p in prods if p["code"] == sel_code), "")
+                new_name = c2.text_input("שם תצוגה חדש", value=current_name).strip()
+                if st.button("עדכן שם"):
+                    if not new_name:
+                        st.error("שם חדש לא יכול להיות ריק.")
+                    elif new_name == current_name:
+                        st.info("לא בוצע שינוי.")
+                    else:
+                        for p in prods:
+                            if p["code"] == sel_code:
+                                p["name"] = new_name
+                                break
+                        save_products(prods)
+                        refresh_products()
+                        st.success("שם המוצר עודכן בהצלחה.")
+                        st.rerun()
+                        st.rerun()
         data = load_bonus_schedules()
         schedules = data["schedules"][:]
         if not schedules:
-            st.error("לא נמצא קובץ בונוסים.")
+            st.error("לא נמצא קובץ/מסמך בונוסים.")
         else:
             st.subheader("➕ יצירת/עדכון לוח מחירים חדש")
             c1, c2 = st.columns([1,3])
@@ -983,13 +1381,12 @@ if user.get("is_admin") and maybe_admin_tabs:
                 if not replaced:
                     data["schedules"].append({"effective_date": eff_date.isoformat(), "prices": new_prices})
                 save_bonus_schedules(data)
-                # AUTO POPUP to all users
                 create_message(
-                    text=f"עודכן לוח בונוסים החל מ־{eff_date.isoformat()}. אנא עיינו בשינויים.",
+                    text=f"עודכן לוח בונוסים החל מ־{eff_date.isoformat()}.",
                     target_all=True, target_emails=[], target_teams=[],
-                    sticky=True, meta={"type":"bonus_update","effective_date":eff_date.isoformat(),"prices":new_prices}, title="שינוי בונוס"
+                    sticky=True, meta={"type":"bonus_update","effective_date":eff_date.isoformat(),"prices":new_prices}, title="שינוי בונוס", sender="system"
                 )
-                st.success("לוח המחירים נשמר/עודכן ונשלחה הודעת POP-UP לכל המשתמשים.")
+                st.success("לוח המחירים נשמר/עודכן.")
                 st.rerun()
 
             st.markdown("---")
@@ -1017,35 +1414,22 @@ if user.get("is_admin") and maybe_admin_tabs:
                         if not found:
                             d_all["schedules"].append({"effective_date": new_eff.isoformat(), "prices": edited})
                         save_bonus_schedules(d_all)
-                        create_message(
-                            text=f"עודכן לוח בונוסים (תוקף מ־{new_eff.isoformat()}).",
-                            target_all=True, target_emails=[], target_teams=[],
-                            sticky=True, meta={"type":"bonus_update","effective_date":new_eff.isoformat(),"prices":edited}, title="שינוי בונוס"
-                        )
-                        st.success("עודכן ונשלחה הודעת POP-UP לכל המשתמשים.")
+                        st.success("עודכן.")
                         st.rerun()
                     if cc3.button("מחיקה", key=f"del_{sch['effective_date']}"):
                         d_all = load_bonus_schedules()
                         d_all["schedules"] = [s for s in d_all["schedules"] if s["effective_date"] != sch["effective_date"]]
                         if not d_all["schedules"]:
-                            st.error("לא ניתן למחוק את כל הלוחות. חייב להישאר לפחות לוח אחד.")
+                            st.error("לא ניתן למחוק את כל הלוחות.")
                         else:
                             save_bonus_schedules(d_all)
-                            create_message(
-                                text=f"לוח בונוסים בתוקף מ־{sch['effective_date']} נמחק.",
-                                target_all=True, target_emails=[], target_teams=[],
-                                sticky=True, meta={"type":"bonus_delete","effective_date":sch['effective_date']}, title="שינוי בונוס"
-                            )
-                            st.success("נמחק ונשלחה הודעת POP-UP לכל המשתמשים.")
+                            st.success("נמחק.")
                             st.rerun()
 
-    # --- Admin Commands (POP-UP) ---
     with tab_admin_cmds:
         st.header("📣 פקודות / הודעות POP-UP (אדמין)")
-        st.caption("שליחת הודעת מערכת קופצת למשתמשים: ספציפיים, לפי צוות, או לכולם. כל משתמש רואה את ההודעה פעם אחת עד שיסגור אותה.")
-
-        db = load_users()
-        all_users = list(db.get("users", {}).values())
+        dbu = load_users()
+        all_users = list(dbu.get("users", {}).values())
         all_emails = [u["email"] for u in all_users]
         all_teams = sorted({u.get("team","") for u in all_users if u.get("team")})
 
@@ -1067,32 +1451,60 @@ if user.get("is_admin") and maybe_admin_tabs:
                 st.error("בחר משתמשים/צוותים או סמן 'שלח לכולם'.")
             else:
                 title_final = title_msg.strip() if title_msg and title_msg.strip() else "הודעה"
-                msg_id = create_message(text=text, target_all=send_to_all, target_emails=target_users, target_teams=target_teams, sticky=sticky, meta={"type":"admin_manual"}, title=title_final)
+                msg_id = create_message(text=text, target_all=send_to_all, target_emails=target_users, target_teams=target_teams, sticky=sticky, meta={"type":"admin_manual"}, title=title_final, sender=user["email"])
                 st.success(f"נשלחה הודעה (msg_id={msg_id[:8]}...).")
 
         st.markdown("---")
-        st.subheader("📜 היסטוריית הודעות")
+        st.subheader("🧹 ניהול והסרת הודעות")
         md = load_messages()
-        msgs = sorted(md["messages"], key=lambda m: m.get("created_at",""), reverse=True)
-        for m in msgs:
-            with st.expander(f"#{m['id'][:8]} • {'פעילה' if m.get('active',True) else 'כבויה'} • {m.get('created_at','')}"):
-                st.write(m.get("text",""))
-                st.json({
-                    "target_all": m.get("target_all"),
-                    "target_emails": m.get("target_emails"),
-                    "target_teams": m.get("target_teams"),
-                    "sticky": m.get("sticky"),
-                    "dismissed_count": len(m.get("dismissed_for",[]))
-                })
-                c1, c2, c3 = st.columns([1,1,2])
-                new_active = c1.toggle("פעילה", value=m.get("active", True), key=f"act_{m['id']}")
-                if c2.button("שמירת מצב פעילה", key=f"save_active_{m['id']}"):
-                    update_message(m["id"], active=new_active)
-                    st.success("עודכן.")
-                    st.rerun()
-                if c3.button("מחיקה", key=f"del_msg_{m['id']}"):
-                    delete_message(m["id"])
-                    st.success("נמחקה.")
-                    st.rerun()
+        all_msgs = sorted(md.get("messages", []), key=lambda m: m.get("created_at",""), reverse=True)
 
-end_skin()
+        colm1, colm2 = st.columns([1,1])
+        show_only_mine = colm1.checkbox("הצג רק הודעות ששלחתי", value=True)
+        show_active_only = colm2.checkbox("הצג רק פעילות", value=False)
+
+        filtered = []
+        for m in all_msgs:
+            if show_only_mine and m.get("sender") != user["email"]:
+                continue
+            if show_active_only and not m.get("active", True):
+                continue
+            filtered.append(m)
+
+        st.caption(f"נמצאו {len(filtered)} הודעות.")
+
+        if filtered:
+            cbulk1, cbulk2 = st.columns([1,3])
+            sel_ids = cbulk2.multiselect("בחר הודעות למחיקה", options=[m["id"] for m in filtered],
+                                         format_func=lambda mid: next((f"{x.get('title','הודעה')} • {fmt_ts(x.get('created_at',''))}" for x in filtered if x["id"]==mid), mid))
+            if cbulk1.button("מחק נבחרות", type="secondary", disabled=not sel_ids):
+                for mid in sel_ids:
+                    delete_message(mid)
+                st.success(f"נמחקו {len(sel_ids)} הודעות.")
+                st.rerun()
+
+            for m in filtered[:100]:
+                with st.expander(f"{m.get('title','הודעה')} • {fmt_ts(m.get('created_at',''))}  —  נשלח ע\"י {m.get('sender','system')}", expanded=False):
+                    st.write(m.get("text",""))
+                    info = {
+                        "לכולם": m.get("target_all", False),
+                        "משתמשים": m.get("target_emails", []),
+                        "צוותים": m.get("target_teams", []),
+                        "דביקה": m.get("sticky", True),
+                        "פעילה": m.get("active", True),
+                        "id": m.get("id")
+                    }
+                    st.json(info)
+                    cda, cdb = st.columns([1,1])
+                    if cda.button("🗑️ מחק הודעה", key=f"delmsg_{m['id']}"):
+                        delete_message(m["id"])
+                        st.success("הודעה נמחקה.")
+                        st.rerun()
+                    if cdb.button("בטל/הפעל", key=f"togglemsg_{m['id']}"):
+                        update_message(m["id"], active=(not m.get("active", True)))
+                        st.success("סטטוס עודכן.")
+                        st.rerun()
+        else:
+            st.caption("אין הודעות לתצוגה.")
+
+    
