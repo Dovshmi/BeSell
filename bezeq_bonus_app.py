@@ -746,6 +746,11 @@ def build_group_timeseries(members: list, period: str, start_d: date | None = No
     df = pd.DataFrame(rows).groupby(["bucket","email"], as_index=False)["bonus"].sum()
     df_p = df.pivot_table(index="bucket", columns="email", values="bonus", aggfunc="sum").fillna(0)
     df_p = df_p.rename(columns=email_to_label)
+    # Ensure full bucket coverage (e.g., 24 hours for "היום" or full date range) so single events still render as a line
+    try:
+        df_p = df_p.reindex(idx, fill_value=0)
+    except Exception:
+        pass
     df_p = df_p.reindex(idx, fill_value=0)
     return df_p
 
@@ -803,7 +808,8 @@ with st.sidebar:
             col1, col2 = st.columns(2)
             with col1:
                 new_name = st.text_input("שם עובד", value=user.get("name",""))
-                new_team = st.text_input("צוות", value=user.get("team",""))
+                st.text_input("צוות", value=user.get("team",""), disabled=True)
+                new_team = user.get("team","")
                 invisible = st.checkbox("בלתי נראה בדשבורד צוותי", value=user.get("invisible", False))
                 color = st.color_picker("צבע משתמש", value=user.get("color", "#4F46E5"))
             with col2:
@@ -812,14 +818,16 @@ with st.sidebar:
                 monthly_goal = st.number_input("יעד חודשי (₪)", min_value=0, step=10, value=int(user.get("goals",{}).get("monthly",0)))
                 st.text_input("הרשאה", value=("אדמין" if user.get("is_admin") else "משתמש"), disabled=True)
             if st.button("שמירת פרופיל", use_container_width=True):
-                ok, msg = update_user(
-                    user["email"],
+                payload = dict(
                     invisible=bool(invisible),
                     color=str(color),
                     goals={"daily": int(daily_goal), "weekly": int(weekly_goal), "monthly": int(monthly_goal)},
                     name=new_name,
-                    team=new_team,
                 )
+                # שינוי צוות רק ע"י אדמין
+                if user.get("is_admin"):
+                    payload["team"] = str(new_team)
+                ok, msg = update_user(user["email"], **payload)
                 if ok:
                     st.success("הפרופיל נשמר.")
                     db = load_users()
@@ -915,13 +923,16 @@ def end_skin():
     st.markdown("</div>", unsafe_allow_html=True)
 
 begin_skin(st.session_state.theme_light)
-st.title("📊 ברדק • מערכת בונוסים למוקד תמיכה")
+st.markdown(
+    "<h1 style='text-align:right; direction:rtl; margin:0'>ברדק • מערכת בונוסים 📊</h1>",
+    unsafe_allow_html=True
+)
 
 def view_auth():
     tab_login, tab_register = st.tabs(["התחברות", "הרשמה"])
     with tab_login:
         st.subheader("כניסה למערכת")
-        email = st.text_input("אימייל", key="login_email")
+        email = st.text_input("אימייל / שם משתמש", key="login_email")
         pwd = st.text_input("סיסמה", type="password", key="login_pwd")
         if st.button("התחברות"):
             ok, res = authenticate(email, pwd)
@@ -934,8 +945,9 @@ def view_auth():
     with tab_register:
         st.subheader("הרשמה לעובדים")
         name = st.text_input("שם מלא", key="reg_name")
-        email = st.text_input("אימייל", key="reg_email")
-        team = st.text_input("צוות", key="reg_team", placeholder="למשל: חיפה, דרום, ירושלים...")
+        email = st.text_input("אימייל / שם משתמש", key="reg_email")
+        team_label = st.selectbox("צוות", options=[f"צוות {i}" for i in range(1,6)], index=0, key="reg_team")
+        team = str(team_label.split()[-1])
         invisible = st.checkbox("בלתי נראה בטבלת הצוות", value=False, help="אם מסומן – לא תופיע/י בדשבורד הצוותי")
         pwd = st.text_input("סיסמה", type="password", key="reg_pwd")
         pwd2 = st.text_input("אימות סיסמה", type="password", key="reg_pwd2")
@@ -1112,14 +1124,23 @@ with tab_team:
     else:
         cumulative = st.toggle("הצג מצטבר", value=True, help="סיכום מצטבר לאורך הציר")
         to_plot = df_series.cumsum() if cumulative else df_series
+        names = [_display_label(m) for m in members]
+        colors = [m.get("color", "#4F46E5") for m in members]
         import altair as alt
         chart = (alt.Chart(to_plot.reset_index().melt(id_vars=to_plot.index.name, var_name="משתמש", value_name="בונוס"))
                  .encode(
                     x=alt.X(f"{to_plot.index.name}:T" if to_plot.index.name=="תאריך" else f"{to_plot.index.name}:O", title=to_plot.index.name),
                     y=alt.Y("בונוס:Q"),
-                    color=alt.Color("משתמש:N")
-                 ).mark_line())
-        st.altair_chart(chart, use_container_width=True)
+                    color=alt.Color("משתמש:N", scale=alt.Scale(domain=names, range=colors))
+                 ).mark_line(point=True))
+        point_layer = (alt.Chart(to_plot.reset_index().melt(id_vars=to_plot.index.name, var_name="משתמש", value_name="בונוס"))
+                 .encode(
+                    x=alt.X(f"{to_plot.index.name}:T" if to_plot.index.name=="תאריך" else f"{to_plot.index.name}:O", title=to_plot.index.name),
+                    y=alt.Y("בונוס:Q"),
+                    color=alt.Color("משתמש:N", scale=alt.Scale(domain=names, range=colors))
+                 ).mark_point(size=60))
+        st.altair_chart(chart + point_layer, use_container_width=True)
+
 with tab_reports:
     st.subheader("דוחות אישיים וייצוא")
     today = now_ij().date()
@@ -1227,7 +1248,8 @@ if user.get("is_admin") and maybe_admin_tabs:
                 col1, col2 = st.columns(2)
                 with col1:
                     new_name = st.text_input("שם", value=u.get("name",""), key=f"name_{u['email']}")
-                    new_team = st.text_input("צוות", value=u.get("team",""), key=f"team_{u['email']}")
+                    label_team = st.selectbox("צוות", options=[f"צוות {i}" for i in range(1,6)], index=max(0, int(u.get("team","1"))-1), key=f"team_{u['email']}")
+                    new_team = str(label_team.split()[-1])
                     new_invis = st.checkbox("בלתי נראה בדשבורד צוותי", value=u.get("invisible", False), key=f"invis_{u['email']}")
                     new_color = st.color_picker("צבע משתמש", value=u.get("color", "#4F46E5"), key=f"color_{u['email']}")
                 with col2:
