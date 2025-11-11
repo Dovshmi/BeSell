@@ -1,4 +1,54 @@
 
+
+# === Goals progress helpers (sidebar mini-dashboard) ===
+def _pct_color(p):
+    # color by progress percent: red <50%, yellow 50–99%, green >=100%
+    if p >= 100: return "#10b981"  # green
+    if p >= 50:  return "#f59e0b"  # amber
+    return "#ef4444"               # red
+
+def _goal_bar_html(label: str, current: int, goal: int):
+    # calculate percent and return HTML for a compact progress bar
+    if goal and goal > 0:
+        pct_exact = (current / goal) * 100.0
+        pct = max(0, min(100, int(pct_exact)))
+        color = _pct_color(int(pct_exact))
+        note = f"{current:,}₪ / {goal:,}₪ · {pct}%"
+    else:
+        pct, color = 0, "#6b7280"
+        note = f"{current:,}₪ · אין יעד"
+    return f"""
+    <div class="goalbar">
+      <div class="goalbar-row">
+        <div class="goalbar-label">{label}</div>
+        <div class="goalbar-note">{note}</div>
+      </div>
+      <div class="goalbar-track">
+        <div class="goalbar-fill" style="width:{pct}%; background:{color};"></div>
+      </div>
+    </div>
+    """
+
+# Inject CSS for goal bars
+import streamlit as _st_for_css_only  # safe alias in case top-level 'st' isn't yet imported at this point
+try:
+    _st_for_css_only.markdown("""
+<style>
+.goalbar { margin: .35rem 0 .6rem 0; direction: rtl; }
+.goalbar-row { display:flex; justify-content:space-between; align-items:center; gap:.5rem; margin-bottom:.25rem; }
+.goalbar-label { font-weight:700; }
+.goalbar-note { font-size:.85rem; opacity:.85; }
+.goalbar-track { width:100%; height:12px; border-radius:999px; background:rgba(255,255,255,0.08); position:relative; overflow:hidden; border:1px solid rgba(255,255,255,0.12); }
+.app-skin .goalbar-track { background:#111; border-color:#222; }
+.light.app-skin .goalbar-track { background:#e5e7eb; border-color:#d1d5db; }
+.goalbar-fill { height:100%; border-radius:inherit; transition:width .3s ease; }
+</style>
+""", unsafe_allow_html=True)
+except Exception:
+    pass
+# === /Goals progress helpers ===
+
+
 # bezeq_bonus_app_version 8 (Firebase optional)
 # -*- coding: utf-8 -*-
 import json, csv, io, sys, subprocess, random, uuid, os, tempfile
@@ -465,6 +515,24 @@ def check_password(password: str, hashed: str) -> bool:
         return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
+def set_last_login(email: str):
+    """Stamp last login for user (both Firebase and local JSON modes)."""
+    ts = now_ij().isoformat()
+    email_l = email.lower().strip()
+    if FIREBASE_ENABLED:
+        try:
+            DB.collection("users").document(email_l).set({"last_login_at": ts}, merge=True)
+        except Exception:
+            pass
+    else:
+        db = load_users()
+        u = db.get("users", {}).get(email_l)
+        if u is not None:
+            u["last_login_at"] = ts
+            db["users"][email_l] = u
+            save_users(db)
+
+
 
 def now_ij():
     return datetime.now(APP_TZ)
@@ -544,7 +612,11 @@ def authenticate(email, password):
         return False, "משתמש לא נמצא."
     if not check_password(password, user["password"]):
         return False, "סיסמה שגויה."
-    return True, user
+        # On successful authentication, stamp last login and refresh user dict
+    set_last_login(email)
+    db2 = load_users()
+    user2 = db2['users'].get(email.lower().strip(), user)
+    return True, user2
 
 def update_user(email, **fields):
     if "is_admin" in fields:
@@ -779,7 +851,6 @@ if "theme_light" not in st.session_state:
     st.session_state.theme_light = True
 if "user" not in st.session_state:
     st.session_state.user = None
-
 with st.sidebar:
     st.caption("📡 מצב אחסון: " + ("Firebase Firestore" if FIREBASE_ENABLED else "קבצי JSON מקומיים"))
     with st.expander("Diagnostics"):
@@ -798,9 +869,42 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("### ⚙️ לוח בקרה")
-    st.session_state.theme_light = st.toggle("מצב Light", value=st.session_state.get("theme_light", True))
 
+    # --- Goals progress (sidebar) [placed here instead of Light toggle] ---
+    try:
+        if st.session_state.get("user"):
+            _u = st.session_state["user"]
+            today = now_ij().date() if "now_ij" in globals() else __import__("datetime").datetime.now().date()
+            daily_val = sum_bonus_for_email_range(_u["email"], today, today) if "sum_bonus_for_email_range" in globals() else 0
+            if "week_bounds" in globals():
+                wk_s, wk_e = week_bounds(today)
+            else:
+                import datetime as _dt
+                wk_s = today - _dt.timedelta(days=today.weekday())
+                wk_e = wk_s + _dt.timedelta(days=6)
+            weekly_val = sum_bonus_for_email_range(_u["email"], wk_s, wk_e) if "sum_bonus_for_email_range" in globals() else 0
+            if "month_bounds" in globals():
+                mo_s, mo_e = month_bounds(today)
+            else:
+                import calendar as _cal, datetime as _dt
+                mo_s = today.replace(day=1)
+                last_day = _cal.monthrange(today.year, today.month)[1]
+                mo_e = today.replace(day=last_day)
+            monthly_val = sum_bonus_for_email_range(_u["email"], mo_s, mo_e) if "sum_bonus_for_email_range" in globals() else 0
+    
+            goals = _u.get("goals", {}) or {}
+            g_day = int(goals.get("daily", 0) or 0)
+            g_week = int(goals.get("weekly", 0) or 0)
+            g_month = int(goals.get("monthly", 0) or 0)
+    
+            st.markdown("### 🎯 התקדמות יעדים")
+            st.markdown(_goal_bar_html("יעד יומי",   int(daily_val),   g_day),   unsafe_allow_html=True)
+            st.markdown(_goal_bar_html("יעד שבועי",  int(weekly_val),  g_week),  unsafe_allow_html=True)
+            st.markdown(_goal_bar_html("יעד חודשי",  int(monthly_val), g_month), unsafe_allow_html=True)
+    except Exception as _e_goalbars:
+        st.caption(f"⚠️ לא ניתן להציג התקדמות יעדים: {_e_goalbars}")
+    
+    st.markdown("### ⚙️ לוח בקרה")
     if st.session_state.user:
         with st.popover("פרופיל והגדרות", use_container_width=True):
             st.caption("עריכת פרופיל, צבע, יעדים והרשאות נראות בצוות")
@@ -1231,6 +1335,7 @@ if user.get("is_admin") and maybe_admin_tabs:
                 "is_admin": u.get("is_admin", False),
                 "color": u.get("color",""),
                 "created_at": u.get("created_at",""),
+                "last_login_at": u.get("last_login_at",""),
                 "goal_daily": u.get("goals",{}).get("daily",0),
                 "goal_weekly": u.get("goals",{}).get("weekly",0),
                 "goal_monthly": u.get("goals",{}).get("monthly",0),
@@ -1244,7 +1349,10 @@ if user.get("is_admin") and maybe_admin_tabs:
 
         st.markdown("---")
         for u in filtered:
-            with st.expander(f"✏️ {u.get('name','ללא שם')}  •  {u.get('email','')}  •  צוות {u.get('team','לא מוגדר')}"):
+            with st.expander(
+    f"✏️ {u.get('name','ללא שם')}  •  {u.get('email','')}  •  צוות {u.get('team','לא מוגדר')}"
+    f"  •  התחבר לאחרונה: {fmt_ts(u.get('last_login_at',''))}"
+):
                 col1, col2 = st.columns(2)
                 with col1:
                     new_name = st.text_input("שם", value=u.get("name",""), key=f"name_{u['email']}")
@@ -1259,6 +1367,7 @@ if user.get("is_admin") and maybe_admin_tabs:
                     g_m = st.number_input("יעד חודשי (₪)", min_value=0, step=10, value=int(goals.get("monthly",0)), key=f"gmonth_{u['email']}")
                     st.text_input("סטטוס", value=("אדמין" if u.get("is_admin") else "משתמש"), disabled=True, key=f"role_{u['email']}")
 
+                st.caption(f"פעם אחרונה מחובר: {fmt_ts(u.get('last_login_at',''))}")
                 cA, cB, cC = st.columns([1,1,2])
                 if cA.button("שמירת שינויים", key=f"save_{u['email']}"):
                     ok, msg = update_user(
