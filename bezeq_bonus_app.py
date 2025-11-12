@@ -827,7 +827,7 @@ def build_group_timeseries(members: list, period: str, start_d: date | None = No
     df_p = df_p.reindex(idx, fill_value=0)
     return df_p
 
-st.set_page_config(page_title="ברדק • בונוס מכירות – מוקד תמיכה", page_icon="📊", layout="wide")
+st.set_page_config(page_title="ברדק • בונוס מכירות – מוקד תמיכה", page_icon="💰", layout="wide")
 
 def inject_base_css():
     st.markdown("""
@@ -1029,7 +1029,7 @@ def end_skin():
 
 begin_skin(st.session_state.theme_light)
 st.markdown(
-    "<h1 style='text-align:right; direction:rtl; margin:0'>ברדק • מערכת בונוסים 📊</h1>",
+    "<h1 style='text-align:right; direction:rtl; margin:0'>ברדק • מערכת בונוסים 💰</h1>",
     unsafe_allow_html=True
 )
 
@@ -1132,7 +1132,7 @@ with tab_today:
     # WhatsApp share (group: טכני חיפה - מכירות). Sends only product names and quantities.
     share_text = build_whatsapp_daily_text(user.get("name","ללא שם"), today, counts_today)
     st.caption("שליחת הדיווח לוואטסאפ (ללא ציון בונוסים)")
-    st.link_button("שליחה לוואטסאפ – טכני חיפה · מכירות", whatsapp_share_url(share_text), use_container_width=True)
+    st.link_button("💸 Whatsapp - שליחת סיכום יומי", whatsapp_share_url(share_text), use_container_width=True)
 
     bonus_today = sum(qty * get_bonus_for(code, today) for code, qty in counts_today.items())
     c1, c2, c3, c4 = st.columns(4)
