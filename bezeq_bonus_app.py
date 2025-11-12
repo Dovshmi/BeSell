@@ -47,6 +47,7 @@ try:
 except Exception:
     pass
 # === /Goals progress helpers ===
+import urllib.parse
 
 
 # bezeq_bonus_app_version 8 (Firebase optional)
@@ -1086,6 +1087,27 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+def build_whatsapp_daily_text(display_name: str, day_date, counts: dict) -> str:
+    """Create a Hebrew WhatsApp message of today's sales (product + quantity only)."""
+    # Keep only >0 items
+    lines = []
+    for p in PRODUCTS:
+        qty = int(counts.get(p["code"], 0) or 0)
+        if qty > 0:
+            # e.g., "מודם: 3"
+            lines.append(f"{p['name']}: {qty}")
+    if not lines:
+        lines.append("אין פריטים מדווחים להיום.")
+    dstr = day_date.strftime("%d.%m.%Y")
+    header = f"דיווח מכירות – {display_name} – {dstr}"
+    body = "\n".join(lines)
+    return f"{header}\n{body}"
+
+def whatsapp_share_url(message_text: str) -> str:
+    # Use wa.me for cross‑platform compatibility; user selects the target chat (group).
+    return "https://wa.me/?text=" + urllib.parse.quote(message_text)
+
 tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא"]
 if user.get("is_admin"):
     tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)", "פקודות (אדמין)"])
@@ -1107,6 +1129,11 @@ with tab_today:
         st.success("הנתונים נשמרו להיום!")
 
     counts_today = get_counts_for_user_date(user["email"], today)
+    # WhatsApp share (group: טכני חיפה - מכירות). Sends only product names and quantities.
+    share_text = build_whatsapp_daily_text(user.get("name","ללא שם"), today, counts_today)
+    st.caption("שליחת הדיווח לוואטסאפ (ללא ציון בונוסים)")
+    st.link_button("שליחה לוואטסאפ – טכני חיפה · מכירות", whatsapp_share_url(share_text), use_container_width=True)
+
     bonus_today = sum(qty * get_bonus_for(code, today) for code, qty in counts_today.items())
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("בונוס היום (₪)", int(bonus_today))
