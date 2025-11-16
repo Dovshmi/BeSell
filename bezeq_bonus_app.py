@@ -533,6 +533,83 @@ def set_last_login(email: str):
             db["users"][email_l] = u
             save_users(db)
 
+def start_user_session(email: str, hours: int = 8) -> tuple[str, str]:
+    """Create a new session for this user, store it on the user record, and return (sid, expires_at_iso)."""
+    ts_start = now_ij()
+    expires = (ts_start + timedelta(hours=hours)).isoformat()
+    sid = str(uuid.uuid4())
+    email_l = email.lower().strip()
+    if FIREBASE_ENABLED:
+        try:
+            DB.collection("users").document(email_l).set({
+                "session_sid": sid,
+                "session_expires_at": expires,
+            }, merge=True)
+        except Exception:
+            # If session update fails, we still allow login – user will just not have server-side session metadata.
+            pass
+    else:
+        db = load_users()
+        u = db.get("users", {}).get(email_l)
+        if u is not None:
+            u["session_sid"] = sid
+            u["session_expires_at"] = expires
+            db["users"][email_l] = u
+            save_users(db)
+    return sid, expires
+
+
+def clear_user_session(email: str):
+    """Clear user's session id from the DB/JSON (used on logout)."""
+    email_l = email.lower().strip()
+    if FIREBASE_ENABLED:
+        try:
+            DB.collection("users").document(email_l).set({
+                "session_sid": None,
+                "session_expires_at": None,
+            }, merge=True)
+        except Exception:
+            # Logout should not crash the app if Firestore write fails
+            pass
+    else:
+        db = load_users()
+        u = db.get("users", {}).get(email_l)
+        if u is not None:
+            u.pop("session_sid", None)
+            u.pop("session_expires_at", None)
+            db["users"][email_l] = u
+            save_users(db)
+
+
+def get_user_by_session(sid: str):
+    """Lookup a user record by its session_sid (for auto-login from URL)."""
+    sid = (sid or "").strip()
+    if not sid:
+        return None
+    if FIREBASE_ENABLED:
+        try:
+            q = DB.collection("users").where("session_sid", "==", sid).limit(1)
+            docs = list(q.stream())
+            if not docs:
+                return None
+            u = docs[0].to_dict()
+            # ensure email present on user dict
+            if "email" not in u:
+                u["email"] = docs[0].id
+            return u
+        except Exception:
+            return None
+    else:
+        db = load_users()
+        for email_l, u in db.get("users", {}).items():
+            if u.get("session_sid") == sid:
+                if "email" not in u:
+                    u["email"] = email_l
+                return u
+        return None
+
+
+
 
 
 def now_ij():
@@ -607,16 +684,21 @@ def register_user(name, email, password, team, invisible):
     return True, "נרשמת בהצלחה! אפשר להתחבר."
 
 def authenticate(email, password):
+    email_l = email.lower().strip()
     db = load_users()
-    user = db["users"].get(email.lower().strip())
+    user = db["users"].get(email_l)
     if not user:
         return False, "משתמש לא נמצא."
     if not check_password(password, user["password"]):
         return False, "סיסמה שגויה."
-        # On successful authentication, stamp last login and refresh user dict
-    set_last_login(email)
+    # On successful authentication, stamp last login and open a new server-side session
+    set_last_login(email_l)
+    sid, exp_at = start_user_session(email_l)
     db2 = load_users()
-    user2 = db2['users'].get(email.lower().strip(), user)
+    user2 = db2["users"].get(email_l, user)
+    # Ensure the in-memory user dict also has the session metadata
+    user2["session_sid"] = sid
+    user2["session_expires_at"] = exp_at
     return True, user2
 
 def update_user(email, **fields):
@@ -827,7 +909,7 @@ def build_group_timeseries(members: list, period: str, start_d: date | None = No
     df_p = df_p.reindex(idx, fill_value=0)
     return df_p
 
-st.set_page_config(page_title="ברדק • בונוס מכירות – מוקד תמיכה", page_icon="💰", layout="wide")
+st.set_page_config(page_title="ברדק - מערכת בונוסים", page_icon="💰", layout="wide")
 
 def inject_base_css():
     st.markdown("""
@@ -852,6 +934,18 @@ if "theme_light" not in st.session_state:
     st.session_state.theme_light = True
 if "user" not in st.session_state:
     st.session_state.user = None
+
+# Auto-login from URL session id if present and no user in session_state yet
+try:
+    if not st.session_state.user:
+        sid_from_url = st.query_params.get("sid")
+        if sid_from_url:
+            u = get_user_by_session(sid_from_url)
+            if u:
+                st.session_state.user = u
+except Exception:
+    pass
+
 with st.sidebar:
     st.caption("📡 מצב אחסון: " + ("Firebase Firestore" if FIREBASE_ENABLED else "קבצי JSON מקומיים"))
     with st.expander("Diagnostics"):
@@ -964,7 +1058,10 @@ with st.sidebar:
             really = st.checkbox("אני מאשר/ת שמחיקת המשתמש תמחק גם את כל הנתונים שלי לצמיתות")
             if st.button("מחק משתמש", type="secondary", use_container_width=True):
                 if really:
-                    delete_user(st.session_state.user["email"])
+                    email_to_delete = st.session_state.user["email"]
+                    # Clear session metadata for this user before deletion
+                    clear_user_session(email_to_delete)
+                    delete_user(email_to_delete)
                     st.success("המשתמש נמחק. מתנתק...")
                     st.session_state.user = None
                     st.rerun()
@@ -973,6 +1070,9 @@ with st.sidebar:
 
         st.markdown("---")
         if st.button("התנתקות", use_container_width=True):
+            # Clear server-side session for this user
+            if st.session_state.user:
+                clear_user_session(st.session_state.user.get("email", ""))
             st.session_state.user = None
             st.rerun()
 
@@ -1043,6 +1143,11 @@ def view_auth():
             ok, res = authenticate(email, pwd)
             if ok:
                 st.session_state.user = res
+                # put session id into URL so refreshes/tab restore still know who is logged-in
+                try:
+                    st.query_params["sid"] = res.get("session_sid", "")
+                except Exception:
+                    pass
                 st.success(f"מחובר כעת: {res['name']} ({res['team']})")
                 st.rerun()
             else:
@@ -1100,7 +1205,7 @@ def build_whatsapp_daily_text(display_name: str, day_date, counts: dict) -> str:
     if not lines:
         lines.append("אין פריטים מדווחים להיום.")
     dstr = day_date.strftime("%d.%m.%Y")
-    header = f"דיווח מכירות – {display_name} – {dstr}"
+    header = f"היום חשמלתי – {display_name} – {dstr}"
     body = "\n".join(lines)
     return f"{header}\n{body}"
 
@@ -1132,7 +1237,7 @@ with tab_today:
     # WhatsApp share (group: טכני חיפה - מכירות). Sends only product names and quantities.
     share_text = build_whatsapp_daily_text(user.get("name","ללא שם"), today, counts_today)
     st.caption("שליחת הדיווח לוואטסאפ (ללא ציון בונוסים)")
-    st.link_button("💸 Whatsapp - שליחת סיכום יומי", whatsapp_share_url(share_text), use_container_width=True)
+    st.link_button("💸Whatsapp - שליחת סיכום יומי", whatsapp_share_url(share_text), use_container_width=True)
 
     bonus_today = sum(qty * get_bonus_for(code, today) for code, qty in counts_today.items())
     c1, c2, c3, c4 = st.columns(4)
