@@ -1129,7 +1129,7 @@ def end_skin():
 
 begin_skin(st.session_state.theme_light)
 st.markdown(
-    "<h1 style='text-align:right; direction:rtl; margin:0'>ברדק • מערכת בונוסים 💰</h1>",
+    "<h1 style='text-align:right; direction:rtl; margin:0'> ברדק • מערכת בונוסים (new site brdk.duckdns.org) 💰</h1>",
     unsafe_allow_html=True
 )
 
