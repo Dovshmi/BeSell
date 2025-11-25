@@ -71,6 +71,9 @@ def ensure(pkg):
 
 HAS_PANDAS = ensure("pandas")
 HAS_BCRYPT = ensure("bcrypt")
+HAS_GOOGLE_GENAI = ensure("google.generativeai")
+HAS_OPENAI = ensure("openai")
+HAS_REQUESTS = ensure("requests")
 
 import streamlit as st
 if not HAS_PANDAS:
@@ -79,10 +82,25 @@ if not HAS_PANDAS:
 import pandas as pd
 import altair as alt
 
+if HAS_GOOGLE_GENAI:
+    import google.generativeai as genai
+else:
+    genai = None
+
+if HAS_OPENAI:
+    from openai import OpenAI
+else:
+    OpenAI = None
+
 if HAS_BCRYPT:
     import bcrypt
 else:
     bcrypt = None
+
+if HAS_REQUESTS:
+    import requests
+else:
+    requests = None
 
 FIREBASE_ENABLED = False
 DB = None
@@ -135,7 +153,7 @@ def init_firebase():
         DB = None
         FIREBASE_DIAG = {"ok": False, "error": str(e), "source": FIREBASE_DIAG.get("source"), "project_id": None}
 
-init_firebase()
+# init_firebase()  # Firebase disabled – using local JSON only
 
 APP_TZ = ZoneInfo("Asia/Jerusalem")
 DATA_DIR = Path("data")
@@ -143,6 +161,61 @@ USERS_PATH = DATA_DIR / "users.json"
 RECORDS_PATH = DATA_DIR / "records.json"
 BONUSES_PATH = DATA_DIR / "bonuses.json"
 MSGS_PATH = DATA_DIR / "messages.json"
+AI_BOTS_PATH = DATA_DIR / "ai_bots.json"
+
+# === Gibberish → Hebrew keyboard fixer (CLI logic, wrapped לפנים האפליקציה) ===
+ENG_TO_HEB = {
+    'q': '/',
+    'w': "'",
+    'e': 'ק',
+    'r': 'ר',
+    't': 'א',
+    'y': 'ט',
+    'u': 'ו',
+    'i': 'ן',
+    'o': 'ם',
+    'p': 'פ',
+    '[': ']',
+    ']': '[',
+
+    'a': 'ש',
+    's': 'ד',
+    'd': 'ג',
+    'f': 'כ',
+    'g': 'ע',
+    'h': 'י',
+    'j': 'ח',
+    'k': 'ל',
+    'l': 'ך',
+    ';': 'ף',
+    "'": ',',   # מקש האפוסטרוף
+
+    'z': 'ז',
+    'x': 'ס',
+    'c': 'ב',
+    'v': 'ה',
+    'b': 'נ',
+    'n': 'מ',
+    'm': 'צ',
+    ',': 'ת',
+    '.': 'ץ',
+    '/': '.',
+
+    '`': ';',   # המקש שמשמאל ל-1
+}
+
+def fix_english_gibberish_to_hebrew(text: str) -> str:
+    """מקבל טקסט שנכתב כשהמקלדת על אנגלית ומחזיר אותו בעברית."""
+    result_chars = []
+    for ch in text:
+        lower = ch.lower()
+        if lower in ENG_TO_HEB:
+            result_chars.append(ENG_TO_HEB[lower])
+        else:
+            # אם אין מיפוי (ספרות, רווחים, תווים אחרים) – משאירים כמו שהוא
+            result_chars.append(ch)
+    return ''.join(result_chars)
+
 
 PRODUCTS = [
     {"code": "fiber_new", "name": "אינטרנט סיבים חדש", "bonus": 23},
@@ -157,6 +230,105 @@ PRODUCTS = [
     {"code": "upgrade_biznet_to_bizfiber", "name": "שדרוג מביזנט (נחושת) לביזפייבר (סיבים)", "bonus": 20},
 ]
 PRODUCT_INDEX = {p["code"]: p for p in PRODUCTS}
+
+
+# ----------------- REMOTE API CONFIG (HOME SERVER) -----------------
+# Home server API for JSON DB, e.g. FastAPI at: http://46.120.124.168:8000
+# Endpoints are assumed like:
+#   GET  /data/users      -> contents of users.json
+#   PUT  /data/users      -> replace users.json
+#   GET  /data/records    -> contents of records.json
+#   PUT  /data/records
+#   GET/PUT /data/bonuses -> bonuses.json  (products + schedules)
+#   GET/PUT /data/messages -> messages.json
+#   GET/PUT /data/ai_bots  -> ai_bots.json
+
+REMOTE_API_BASE = (
+    os.environ.get("REMOTE_API_BASE")
+    or os.environ.get("BESELL_API_BASE")
+    or None
+)
+
+REMOTE_API_TOKEN = (
+    os.environ.get("REMOTE_API_TOKEN")
+    or os.environ.get("BESELL_API_TOKEN")
+    or None
+)
+
+# Try to read from Streamlit secrets
+try:
+    _remote_conf = st.secrets.get("REMOTE_API", {})
+except Exception:
+    _remote_conf = {}
+
+if isinstance(_remote_conf, dict) and _remote_conf:
+    REMOTE_API_BASE = _remote_conf.get("BASE_URL", REMOTE_API_BASE)
+    REMOTE_API_TOKEN = _remote_conf.get("TOKEN", REMOTE_API_TOKEN)
+
+# Default to your public IP if nothing else given
+if not REMOTE_API_BASE:
+    REMOTE_API_BASE = "http://46.120.124.168:8000"
+
+REMOTE_API_BASE = (REMOTE_API_BASE or "").rstrip("/")
+
+# Custom header name used by your FastAPI middleware
+REMOTE_API_HEADER_NAME = (
+    os.environ.get("REMOTE_API_HEADER_NAME")
+    or (_remote_conf.get("HEADER_NAME") if isinstance(_remote_conf, dict) else None)
+    or "change-me-123"
+)
+
+
+REMOTE_API_ENABLED = bool(REMOTE_API_BASE and HAS_REQUESTS)
+REMOTE_API_HEADERS = (
+    {REMOTE_API_HEADER_NAME: REMOTE_API_TOKEN}
+    if REMOTE_API_TOKEN
+    else {}
+)
+
+REMOTE_API_DIAG = {
+    "enabled": REMOTE_API_ENABLED,
+    "base_url": REMOTE_API_BASE,
+    "has_token": bool(REMOTE_API_HEADERS),
+    "error": None,
+}
+
+
+def _api_request(method: str, name: str, json_body=None):
+    """
+    Internal helper to talk with the home-server API.
+    'name' is logical file name without .json, e.g. 'users', 'records', 'bonuses', 'messages', 'ai_bots'
+    """
+    if not REMOTE_API_ENABLED or requests is None:
+        return None, "REMOTE_API not enabled"
+
+    url = f"{REMOTE_API_BASE}/data/{name}"
+    try:
+        resp = requests.request(
+            method.upper(),
+            url,
+            headers=REMOTE_API_HEADERS,
+            json=json_body,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        if method.upper() == "GET":
+            return resp.json(), None
+        return True, None
+    except Exception as e:
+        REMOTE_API_DIAG["error"] = str(e)
+        return None, str(e)
+
+
+def api_get_json(name: str):
+    data, err = _api_request("GET", name)
+    return data
+
+
+def api_put_json(name: str, data):
+    ok, err = _api_request("PUT", name, json_body=data)
+    return bool(ok) and err is None
+
 
 def ensure_files():
     DATA_DIR.mkdir(exist_ok=True)
@@ -174,6 +346,23 @@ def ensure_files():
         }, ensure_ascii=False, indent=2), encoding="utf-8")
     if not MSGS_PATH.exists():
         MSGS_PATH.write_text(json.dumps({"messages": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if not AI_BOTS_PATH.exists():
+        # ברירת מחדל: בוט אחד כללי, כדי שהמערכת תעבוד גם בלי קובץ ידני
+        default_bots = {
+            "bots": [
+                {
+                    "id": "default_helper",
+                    "name": "GPT-4o Mordi (כללי ומהיר)",
+                    "topic": "עוזר כללי לנציגים במערכת ברדק.",
+                    "persona": "אתה עוזר חכם, נעים וממוקד, שמסייע לנציגי בזק בשאלות על בונוסים, מכירות ותמיכה טכנית. השפה יומיומית, תמציתית וברורה.",
+                    "enabled": True,
+                    "model": "gpt-4o-mini",
+                }
+            ]
+        }
+        AI_BOTS_PATH.write_text(json.dumps(default_bots, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def _fs_users_load():
     assert FIREBASE_ENABLED and DB
@@ -269,95 +458,174 @@ def _fs_messages_save(data: dict):
 def load_users():
     if FIREBASE_ENABLED:
         return _fs_users_load()
+
+    # Try remote API first
+    if REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("users")
+        if isinstance(data, dict):
+            return data
+
+    # Fallback: local JSON file
     ensure_files()
     with open(USERS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def save_users(data):
     if FIREBASE_ENABLED:
         _fs_users_save(data)
         return
+
+    # Try remote API first
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("users", data):
+            return
+
+    # Fallback: local JSON file
     with open(USERS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def load_records():
     if FIREBASE_ENABLED:
         return _fs_records_load()
+
+    if REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("records")
+        if isinstance(data, dict):
+            return data
+
     ensure_files()
     with open(RECORDS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def save_records(data):
     if FIREBASE_ENABLED:
         _fs_records_replace_all(data)
         return
+
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("records", data):
+            return
+
     with open(RECORDS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def load_bonus_schedules():
     if FIREBASE_ENABLED:
         data = _fs_bonus_load()
-        data["schedules"].sort(key=lambda s: s["effective_date"])
-        return data
-    ensure_files()
-    with open(BONUSES_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data["schedules"].sort(key=lambda s: s["effective_date"])
-    return data
-
-def save_bonus_schedules(data):
-    data["schedules"].sort(key=lambda s: s["effective_date"])
-    if FIREBASE_ENABLED:
-        _fs_bonus_save(data)
-        return
-    with open(BONUSES_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-# --- Extended bonus config helpers (products + schedules) ---
-def load_bonus_config():
-    if FIREBASE_ENABLED:
-        doc = DB.collection("config").document("bonuses").get()
-        data = doc.to_dict() or {}
-        if "schedules" not in data:
-            base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
-            data["schedules"] = [{"effective_date": "1970-01-01", "prices": base_prices}]
-        if "products" not in data or not data["products"]:
-            data["products"] = list(PRODUCTS)
         try:
             data["schedules"].sort(key=lambda s: s["effective_date"])
         except Exception:
             pass
         return data
+
+    if REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("bonuses")
+        if isinstance(data, dict):
+            try:
+                data["schedules"].sort(key=lambda s: s["effective_date"])
+            except Exception:
+                pass
+            return data
+
     ensure_files()
-    try:
-        with open(BONUSES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    if "schedules" not in data:
-        base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
-        data["schedules"] = [{"effective_date": "1970-01-01", "prices": base_prices}]
-    if "products" not in data or not data["products"]:
-        data["products"] = list(PRODUCTS)
+    with open(BONUSES_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
     try:
         data["schedules"].sort(key=lambda s: s["effective_date"])
     except Exception:
         pass
     return data
 
+
+def save_bonus_schedules(data):
+    try:
+        data["schedules"].sort(key=lambda s: s["effective_date"])
+    except Exception:
+        pass
+
+    if FIREBASE_ENABLED:
+        _fs_bonus_save(data)
+        return
+
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("bonuses", data):
+            return
+
+    with open(BONUSES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# --- Extended bonus config helpers (products + schedules) ---
+def load_bonus_config():
+    """Load full bonus configuration (products + schedules)."""
+    data = None
+
+    if FIREBASE_ENABLED:
+        try:
+            doc = DB.collection("config").document("bonuses").get()
+            if doc.exists:
+                data = doc.to_dict() or {}
+        except Exception:
+            data = None
+
+    elif REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("bonuses")
+
+    else:
+        ensure_files()
+        try:
+            with open(BONUSES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+
+    if not isinstance(data, dict):
+        data = {}
+
+    # Ensure minimal structure
+    if "schedules" not in data:
+        base_prices = {p["code"]: int(p["bonus"]) for p in PRODUCTS}
+        data["schedules"] = [{"effective_date": "1970-01-01", "prices": base_prices}]
+
+    if "products" not in data or not data["products"]:
+        data["products"] = list(PRODUCTS)
+
+    try:
+        data["schedules"].sort(key=lambda s: s.get("effective_date", "1970-01-01"))
+    except Exception:
+        pass
+
+    return data
+
+
 def save_bonus_config(data: dict):
-    data = dict(data)
+    """Save full bonus configuration (products + schedules)."""
+    data = dict(data or {})
     schedules = list(data.get("schedules", []))
     try:
-        schedules.sort(key=lambda s: s["effective_date"])
+        schedules.sort(key=lambda s: s.get("effective_date", "1970-01-01"))
     except Exception:
         pass
     products = list(data.get("products", []))
     data2 = {"schedules": schedules, "products": products}
+
     if FIREBASE_ENABLED:
-        DB.collection("config").document("bonuses").set(data2, merge=True)
+        try:
+            DB.collection("config").document("bonuses").set(data2, merge=True)
+        except Exception:
+            pass
         return
+
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("bonuses", data2):
+            return
+
+    ensure_files()
     with open(BONUSES_PATH, "w", encoding="utf-8") as f:
         json.dump(data2, f, ensure_ascii=False, indent=2)
+
 
 def load_products():
     cfg = load_bonus_config()
@@ -385,16 +653,91 @@ refresh_products()
 def load_messages():
     if FIREBASE_ENABLED:
         return _fs_messages_load()
+
+    if REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("messages")
+        if isinstance(data, dict):
+            return data
+
     ensure_files()
     with open(MSGS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def save_messages(data):
     if FIREBASE_ENABLED:
         _fs_messages_save(data)
         return
+
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("messages", data):
+            return
+
     with open(MSGS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_ai_bots():
+    """Load AI bots configuration from Firebase / remote API / local JSON."""
+    data = None
+
+    if FIREBASE_ENABLED:
+        try:
+            doc = DB.collection("config").document("ai_bots").get()
+            if doc.exists:
+                data = doc.to_dict()
+        except Exception:
+            data = None
+
+    elif REMOTE_API_ENABLED and requests is not None:
+        data = api_get_json("ai_bots")
+
+    else:
+        ensure_files()
+        if AI_BOTS_PATH.exists():
+            with open(AI_BOTS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+    if not isinstance(data, dict):
+        data = {"bots": []}
+
+    if "bots" not in data or not isinstance(data["bots"], list):
+        if isinstance(data, list):
+            data = {"bots": data}
+        else:
+            data["bots"] = []
+
+    for i, b in enumerate(data["bots"]):
+        if "id" not in b:
+            b["id"] = f"bot_{i}"
+        b.setdefault("enabled", True)
+        b.setdefault("model", "gpt-4o-mini")
+
+    return data
+
+
+def save_ai_bots(data):
+    """Save AI bots configuration to Firebase / remote API / local JSON."""
+    if not isinstance(data, dict):
+        data = {"bots": []}
+    if "bots" not in data or not isinstance(data["bots"], list):
+        data["bots"] = []
+
+    if FIREBASE_ENABLED:
+        try:
+            DB.collection("config").document("ai_bots").set(data)
+        except Exception:
+            pass
+        return
+
+    if REMOTE_API_ENABLED and requests is not None:
+        if api_put_json("ai_bots", data):
+            return
+
+    ensure_files()
+    with open(AI_BOTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 
 def create_message(text: str, target_all: bool, target_emails: list, target_teams: list, sticky: bool=True, meta: dict|None=None, title: str|None=None, sender: str|None=None):
     msg = {
@@ -610,6 +953,53 @@ def get_user_by_session(sid: str):
 
 
 
+
+
+
+def get_llm7_client():
+    """
+    Return (client, error_message) for LLM7 API via OpenAI-compatible client.
+
+    המפתח נקרא מתוך st.secrets["LLM7"]["API_KEY"] או מהמשתנה LLM7_API_KEY.
+    ניתן גם להגדיר BASE_URL אם השרת של LLM7 משתמש בכתובת שונה מברירת המחדל.
+    """
+    if not HAS_OPENAI or OpenAI is None:
+        return None, "החבילה openai אינה מותקנת. יש להריץ pip install openai."
+
+    api_key = None
+    base_url = None
+
+    # קודם מ-secrets
+    try:
+        conf = st.secrets["LLM7"]
+    except Exception:
+        conf = None
+
+    if conf is not None:
+        try:
+            api_key = conf.get("API_KEY") or conf.get("TOKEN") or conf.get("KEY")
+            base_url = conf.get("BASE_URL")
+        except Exception:
+            pass
+
+    # נפילה חזרה למשתני סביבה
+    if not api_key:
+        api_key = os.environ.get("LLM7_API_KEY")
+
+    if not base_url:
+        base_url = os.environ.get("LLM7_BASE_URL")
+
+    if not api_key:
+        return None, "לא נמצא מפתח API של LLM7. הגדר אותו ב-st.secrets['LLM7']['API_KEY'] או במשתנה LLM7_API_KEY."
+
+    try:
+        if base_url:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            client = OpenAI(api_key=api_key)
+        return client, None
+    except Exception as e:
+        return None, f"שגיאה ביצירת לקוח LLM7: {e}"
 
 
 def now_ij():
@@ -947,10 +1337,20 @@ except Exception:
     pass
 
 with st.sidebar:
-    st.caption("📡 מצב אחסון: " + ("Firebase Firestore" if FIREBASE_ENABLED else "קבצי JSON מקומיים"))
+    # Storage mode indicator
+    if FIREBASE_ENABLED and FIREBASE_DIAG.get("ok"):
+        st.caption("📡 מצב אחסון: Firebase Firestore (ענן)")
+        _diag = FIREBASE_DIAG
+    elif REMOTE_API_ENABLED:
+        st.caption(f"📡 מצב אחסון: API שרת ביתי ({REMOTE_API_BASE})")
+        _diag = REMOTE_API_DIAG
+    else:
+        st.caption("📡 מצב אחסון: קבצי JSON מקומיים (data/*.json)")
+        _diag = {"note": "local JSON only"}
+
     with st.expander("Diagnostics"):
         try:
-            st.json(FIREBASE_DIAG)
+            st.json(_diag)
         except Exception:
             st.write("no diagnostics available")
 
@@ -1129,7 +1529,7 @@ def end_skin():
 
 begin_skin(st.session_state.theme_light)
 st.markdown(
-    "<h1 style='text-align:right; direction:rtl; margin:0'> ברדק • מערכת בונוסים (new site brdk.duckdns.org) 💰</h1>",
+    "<h1 style='text-align:right; direction:rtl; margin:0'>ברדק • מערכת בונוסים 💰</h1>",
     unsafe_allow_html=True
 )
 
@@ -1213,10 +1613,10 @@ def whatsapp_share_url(message_text: str) -> str:
     # Use wa.me for cross‑platform compatibility; user selects the target chat (group).
     return "https://wa.me/?text=" + urllib.parse.quote(message_text)
 
-tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא"]
+tabs = ["היום", "תיקונים / היסטוריה", "דשבורד צוותי", "דוחות וייצוא", "כלים", "עוזר AI"]
 if user.get("is_admin"):
-    tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)", "פקודות (אדמין)"])
-tab_today, tab_prev, tab_team, tab_reports, *maybe_admin_tabs = st.tabs(tabs)
+    tabs.extend(["ניהול משתמשים (אדמין)", "ניהול בונוסים (אדמין)", "פקודות (אדמין)", "הגדרות בכיר (AI)"])
+tab_today, tab_prev, tab_team, tab_reports, tab_tools, tab_ai, *maybe_admin_tabs = st.tabs(tabs)
 
 with tab_today:
     st.subheader("הזנת מכירות להיום")
@@ -1428,6 +1828,132 @@ with tab_reports:
                                file_name=f"personal_{start_d}_{end_d}.csv", mime="text/csv")
         else:
             st.info("אין נתונים בטווח שנבחר.")
+with tab_tools:
+    st.subheader("🔧 כלים")
+    st.caption("כלי עזר קטנים שעוזרים לעבודה ביום‑יום. הכל זמין לכל המשתמשים.")
+
+    tool = st.radio(
+        "בחר כלי:",
+        ["מתרגם גיבריש"],
+        horizontal=True,
+        key="tools_toolbar_choice",
+    )
+
+    if tool == "מתרגם גיבריש":
+        st.markdown("הדבק כאן טקסט שכתבת כשהמקלדת הייתה באנגלית, ותקבל אותו מתוקן לעברית לפי פריסת המקלדת.")
+        input_text = st.text_area(
+            "טקסט בג'יבריש (אנגלית במקום עברית):",
+            key="tools_gibberish_input",
+            height=150,
+        )
+
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            do_fix = st.button("✨ תקן לגיבריש → עברית", use_container_width=True, key="tools_gibberish_btn")
+        with col2:
+            st.caption("הלחיצה לא מוחקת את הטקסט המקורי – רק מייצרת תוצאה למטה להעתקה.")
+
+        if "tools_gibberish_output" not in st.session_state:
+            st.session_state["tools_gibberish_output"] = ""
+
+        if do_fix:
+            if not input_text.strip():
+                st.warning("לא הוזן טקסט לתיקון.")
+            else:
+                fixed = fix_english_gibberish_to_hebrew(input_text)
+                st.session_state["tools_gibberish_output"] = fixed
+                st.success("הטקסט תוקן. אפשר להעתיק מהתוצאה למטה.")
+
+        result = st.session_state.get("tools_gibberish_output", "")
+
+        if result:
+            st.caption("אפשר להעתיק ידנית מהריבוע, או להשתמש בכפתור ההעתקה שלמטה:")
+            st.code(result, language="text")
+
+
+with tab_ai:
+    st.subheader("Bachir ➕")
+    st.caption("הטאב מחובר ל-LLM7 דרך API תואם OpenAI. אפשר לשאול שאלות, לנסח הודעות ללקוחות, רעיונות למכירות ועוד.")
+
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = []
+
+    # בחירת בוט/מודל מתוך קובץ הגדרות AI (ai_bots.json)
+    system_message = ""
+    bots = []
+    try:
+        bots_data = load_ai_bots()
+        bots = [b for b in bots_data.get("bots", []) if b.get("enabled", True)]
+    except Exception as e:
+        st.warning(f"שגיאה בטעינת ai_bots.json: {e}")
+
+    if bots:
+        # מיפוי לפי שם הבוט
+        bot_names = [b.get("name", b.get("id", "בוט ללא שם")) for b in bots]
+        default_index = 0
+        model_label = st.selectbox(
+            "בחר בוט חכם של LLM7",
+            options=bot_names,
+            index=default_index,
+            help="הבוטים מוגדרים בקובץ data/ai_bots.json וניתנים לניהול בדשבורד 'הגדרות בכיר (AI)'.",
+        )
+        selected_bot = next(b for b in bots if b.get("name", b.get("id", "")) == model_label)
+        model_name = selected_bot.get("model") or "gpt-4o-mini"
+        system_message = selected_bot.get("persona") or ""
+        st.caption(f"🎯 נושא הבוט: {selected_bot.get('topic', 'לא הוגדר')}")
+    else:
+        # גיבוי: אם אין קובץ/בוטים – משתמשים במודלים המובנים כמו קודם
+        model_options = {
+            "GPT-4o Mordi (כללי ומהיר)": "gpt-4o-mini",
+            "DeepSeek Leon (חשיבה חזקה)": "deepseek-v3.1",
+            "Llama 3.1 Tal (לא קשור)": "llama-3.1-70b-instruct",
+            "Mistral Small Abu-shandi (חינמי)": "mistral-small-3-free",
+        }
+        model_label = st.selectbox(
+            "בחר מודל של LLM7",
+            options=list(model_options.keys()),
+            index=0,
+            help="תוכל לבחור מודל שונה לפי הצורך: מהיר, חינמי או חזק יותר לחשיבה.",
+        )
+        model_name = model_options[model_label]
+
+    # הצגת היסטוריית שיחה
+    for msg in st.session_state.ai_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_msg = st.chat_input(f"מה תרצה לשאול את {model_name}?")
+    if user_msg:
+        st.session_state.ai_messages.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        client, err = get_llm7_client()
+        if err:
+            st.warning(err)
+        else:
+            with st.chat_message("assistant"):
+                with st.spinner("חושב..."):
+                    try:
+                        chat_messages = []
+                        if system_message:
+                            chat_messages.append({"role": "system", "content": system_message})
+                        chat_messages.extend(
+                            {"role": m["role"], "content": m["content"]}
+                            for m in st.session_state.ai_messages
+                        )
+                        response = client.chat.completions.create(
+                            model=model_name,
+                            messages=chat_messages,
+                        )
+                        answer = response.choices[0].message.content
+                    except Exception as e:
+                        answer = f"שגיאה בקריאה למודל: {e}"
+
+                    st.markdown(answer)
+                    st.session_state.ai_messages.append({"role": "assistant", "content": answer})
+
+
 
 if user.get("is_admin") and maybe_admin_tabs:
     tab_admin_users = maybe_admin_tabs[0]
@@ -1836,6 +2362,74 @@ def _render_suggestion_expander():
             st.link_button("פתח וואטסאפ", _wa_link, use_container_width=True)
         else:
             st.info("מנהל/ת: יש להגדיר SUGGEST.whatsapp_link ב-Secrets או משתני סביבה.")
+
+
+if user.get("is_admin") and maybe_admin_tabs and len(maybe_admin_tabs) > 3:
+    tab_admin_ai = maybe_admin_tabs[3]
+    with tab_admin_ai:
+        st.header("🤖 הגדרות בכיר – ניהול בוטי AI")
+        st.caption("כאן ניתן להגדיר שמות, נושא והתנהגות (פרסונה) של הבוטים, וגם להוסיף בוטים חדשים. ההגדרות נשמרות בקובץ data/ai_bots.json.")
+
+        bots_data = load_ai_bots()
+        bots = bots_data.get("bots", [])
+        if not isinstance(bots, list):
+            st.error("מבנה ai_bots.json אינו תקין (השדה 'bots' חייב להיות רשימה).")
+        else:
+            # --- עריכת בוט קיים ---
+            if bots:
+                bot_labels = [
+                    f"{b.get('name', 'ללא שם')} ({b.get('id', 'בלי-id')})"
+                    for b in bots
+                ]
+                selected_label = st.selectbox("בחר בוט לעריכה", options=bot_labels, key="ai_admin_select")
+                selected_index = bot_labels.index(selected_label)
+                edit_bot = dict(bots[selected_index])
+
+                st.subheader("✏️ עריכת בוט קיים")
+                edit_bot["name"] = st.text_input("שם הבוט", value=edit_bot.get("name", ""), key="ai_admin_name")
+                edit_bot["topic"] = st.text_input("נושא (מה הבוט עושה)", value=edit_bot.get("topic", ""), key="ai_admin_topic")
+                edit_bot["persona"] = st.text_area("התנהגות / פרסונה של הבוט", value=edit_bot.get("persona", ""), height=180, key="ai_admin_persona")
+                edit_bot["model"] = st.text_input("שם המודל (כפי שמוגדר ב-LLM7)", value=edit_bot.get("model", "gpt-4o-mini"), key="ai_admin_model")
+                edit_bot["enabled"] = st.checkbox("הבוט פעיל", value=edit_bot.get("enabled", True), key="ai_admin_enabled")
+
+                if st.button("💾 שמור שינויים לבוט", type="primary", use_container_width=True):
+                    bots[selected_index] = edit_bot
+                    bots_data["bots"] = bots
+                    save_ai_bots(bots_data)
+                    st.success("השינויים נשמרו ל-ai_bots.json ✅")
+                    st.rerun()
+            else:
+                st.info("אין עדיין בוטים בקובץ ai_bots.json. ניתן להוסיף בוט חדש למטה.")
+
+            st.markdown("---")
+            st.subheader("➕ הוספת בוט חדש")
+            new_id = st.text_input("ID פנימי (באנגלית בלבד, חייב להיות ייחודי)", key="ai_admin_new_id")
+            new_name = st.text_input("שם הבוט החדש", key="ai_admin_new_name")
+            new_topic = st.text_input("נושא הבוט החדש", key="ai_admin_new_topic")
+            new_persona = st.text_area("התנהגות / פרסונה של הבוט החדש", key="ai_admin_new_persona", height=140)
+            new_model = st.text_input("שם המודל של הבוט החדש", value="gpt-4o-mini", key="ai_admin_new_model")
+            new_enabled = st.checkbox("הבוט החדש פעיל כברירת מחדל", value=True, key="ai_admin_new_enabled")
+
+            if st.button("🚀 צור בוט חדש", use_container_width=True):
+                if not new_id.strip():
+                    st.error("חובה למלא ID פנימי לבוט.")
+                elif any(b.get("id") == new_id.strip() for b in bots):
+                    st.error("כבר קיים בוט עם אותו ID. בחר ID אחר.")
+                else:
+                    new_bot = {
+                        "id": new_id.strip(),
+                        "name": new_name.strip() or new_id.strip(),
+                        "topic": new_topic.strip(),
+                        "persona": new_persona.strip(),
+                        "enabled": bool(new_enabled),
+                        "model": new_model.strip() or "gpt-4o-mini",
+                    }
+                    bots.append(new_bot)
+                    bots_data["bots"] = bots
+                    save_ai_bots(bots_data)
+                    st.success("הבוט החדש נשמר בקובץ ai_bots.json ✅")
+                    st.rerun()
+
 
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
