@@ -235,13 +235,11 @@ PRODUCT_INDEX = {p["code"]: p for p in PRODUCTS}
 # ----------------- REMOTE API CONFIG (HOME SERVER) -----------------
 # Home server API for JSON DB, e.g. FastAPI at: http://46.120.124.168:8000
 # Endpoints are assumed like:
-#   GET  /data/users      -> contents of users.json
-#   PUT  /data/users      -> replace users.json
-#   GET  /data/records    -> contents of records.json
-#   PUT  /data/records
-#   GET/PUT /data/bonuses -> bonuses.json  (products + schedules)
-#   GET/PUT /data/messages -> messages.json
-#   GET/PUT /data/ai_bots  -> ai_bots.json
+#   GET/PUT /data/users
+#   GET/PUT /data/records
+#   GET/PUT /data/bonuses
+#   GET/PUT /data/messages
+#   GET/PUT /data/ai_bots
 
 REMOTE_API_BASE = (
     os.environ.get("REMOTE_API_BASE")
@@ -255,29 +253,27 @@ REMOTE_API_TOKEN = (
     or None
 )
 
+REMOTE_API_HEADER_NAME = (
+    os.environ.get("REMOTE_API_HEADER_NAME")
+    or "change-me-123"
+)
+
 # Try to read from Streamlit secrets
 try:
-    _remote_conf = st.secrets.get("REMOTE_API", {})
+    if "REMOTE_API" in st.secrets:
+        # st.secrets["REMOTE_API"] behaves like a mapping, convert to plain dict
+        _remote_dict = dict(st.secrets["REMOTE_API"])
+        REMOTE_API_BASE = _remote_dict.get("BASE_URL", REMOTE_API_BASE)
+        REMOTE_API_TOKEN = _remote_dict.get("TOKEN", REMOTE_API_TOKEN)
+        REMOTE_API_HEADER_NAME = _remote_dict.get("HEADER_NAME", REMOTE_API_HEADER_NAME)
 except Exception:
-    _remote_conf = {}
+    pass
 
-if isinstance(_remote_conf, dict) and _remote_conf:
-    REMOTE_API_BASE = _remote_conf.get("BASE_URL", REMOTE_API_BASE)
-    REMOTE_API_TOKEN = _remote_conf.get("TOKEN", REMOTE_API_TOKEN)
-
-# Default to your public IP if nothing else given
+# Default to your public IP if still not set
 if not REMOTE_API_BASE:
     REMOTE_API_BASE = "http://46.120.124.168:8000"
 
 REMOTE_API_BASE = (REMOTE_API_BASE or "").rstrip("/")
-
-# Custom header name used by your FastAPI middleware
-REMOTE_API_HEADER_NAME = (
-    os.environ.get("REMOTE_API_HEADER_NAME")
-    or (_remote_conf.get("HEADER_NAME") if isinstance(_remote_conf, dict) else None)
-    or "change-me-123"
-)
-
 
 REMOTE_API_ENABLED = bool(REMOTE_API_BASE and HAS_REQUESTS)
 REMOTE_API_HEADERS = (
@@ -289,7 +285,8 @@ REMOTE_API_HEADERS = (
 REMOTE_API_DIAG = {
     "enabled": REMOTE_API_ENABLED,
     "base_url": REMOTE_API_BASE,
-    "has_token": bool(REMOTE_API_HEADERS),
+    "has_token": bool(REMOTE_API_TOKEN),
+    "header_name": REMOTE_API_HEADER_NAME,
     "error": None,
 }
 
